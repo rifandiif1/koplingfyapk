@@ -76,15 +76,22 @@ class AppContainer(val context: Context) {
 
     val mediaHttpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .followRedirects(true)
         .followSslRedirects(true)
         .addInterceptor { chain ->
+            val original = chain.request()
             val ua = activeStreamUserAgent.get().orEmpty().ifBlank { "Koplingfy/1.0.0 (Android; Media3)" }
-            val req = chain.request().newBuilder()
+            val builder = original.newBuilder()
                 .header("User-Agent", ua)
-                .build()
-            chain.proceed(req)
+            // Only send YouTube web Origin/Referer when using a browser UA (e.g. TV_EMBEDDED / Piped / Invidious)
+            if (ua.startsWith("Mozilla/") && original.url.host.contains("googlevideo.com", ignoreCase = true)) {
+                builder.header("Origin", "https://www.youtube.com")
+                builder.header("Referer", "https://www.youtube.com/")
+            }
+            chain.proceed(builder.build())
         }
         .build()
 

@@ -3,6 +3,7 @@ package com.example.playback
 import android.content.ComponentName
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -73,7 +74,7 @@ class PlaybackController(
     private var prewarmJob: Job? = null
     private var sleepTimerJob: Job? = null
     private var currentStreamAttempt = 0
-    private val maxStreamAttempts = 4
+    private val maxStreamAttempts = 6
     private var suppressLocalBroadcast = false
 
     // Guards against double-advancing when both Service & MediaController observe STATE_ENDED
@@ -107,6 +108,8 @@ class PlaybackController(
                         pendingTrackToPlay = null
                         playTrack(track, queue)
                     }
+                }.onFailure { err ->
+                    Log.e("KoplingfyPlayback", "Failed to connect MediaController", err)
                 }
             },
             ContextCompat.getMainExecutor(context)
@@ -163,18 +166,22 @@ class PlaybackController(
 
             override fun onPlayerError(error: PlaybackException) {
                 val cur = _state.value.currentTrack ?: return
+                Log.w(
+                    "KoplingfyPlayback",
+                    "PlayerError (${error.errorCodeName}) on '${cur.title}' attempt=$currentStreamAttempt/${maxStreamAttempts}: ${error.message}"
+                )
                 if (currentStreamAttempt < maxStreamAttempts) {
                     val nextAttempt = currentStreamAttempt
                     currentStreamAttempt = nextAttempt + 1
                     _state.value = _state.value.copy(
                         isBuffering = true,
-                        errorMessage = "Menghubungkan jalur stream alternatif..."
+                        errorMessage = "Mencoba jalur audio cadangan (${nextAttempt + 1}/$maxStreamAttempts)..."
                     )
                     resolveJob?.cancel()
                     resolveJob = scope.launch {
                         val settings = settingsDataStore.settingsFlow.first()
                         val retryStream = multiSourceRepository.resolvePlayableStream(cur, settings, nextAttempt)
-                        if (retryStream != null) {
+                        if (retryStream != null && retryStream.url.isNotBlank()) {
                             currentStreamAttempt = maxOf(currentStreamAttempt, retryStream.tierIndex + 1)
                             prepareAndStartSingle(controller, cur, retryStream, autoPlay = true)
                         } else {
@@ -364,7 +371,8 @@ class PlaybackController(
 
         prewarmJob?.cancel()
         prewarmJob = scope.launch(Dispatchers.IO) {
-            delay(2_000L) // Let current track stabilize its buffer first
+            delay(4_000L) // Let current track play and buffer smoothly first
+            if (!_state.value.isPlaying) return@launch
             val settings = settingsDataStore.settingsFlow.first()
             runCatching {
                 multiSourceRepository.resolvePlayableStream(nextTrack, settings, attempt = 0)
@@ -412,6 +420,10 @@ class PlaybackController(
         autoPlay: Boolean,
         startPositionMs: Long = 0L
     ) {
+        Log.d(
+            "KoplingfyPlayback",
+            "Starting '${track.title}' via ${stream.resolverName} (tier=${stream.tierIndex}, mime=${stream.mimeType})"
+        )
         activeStreamUserAgent.set(
             stream.userAgent?.takeIf { it.isNotBlank() } ?: "Koplingfy/1.0.0 (Android; Media3)"
         )
@@ -432,10 +444,13 @@ class PlaybackController(
             .setUri(Uri.parse(stream.url))
             .setMediaMetadata(metadata)
 
-        // Only force explicit MIME type for adaptive manifests (HLS/DASH); let Media3 auto-sniff progressive audio
+        // Force explicit MIME type for adaptive manifests (HLS/DASH); let Media3 auto-sniff progressive audio
         val mime = stream.mimeType
-        if (mime == "application/x-mpegURL" || mime == "application/dash+xml") {
-            itemBuilder.setMimeType(mime)
+        val isHlsUrl = stream.url.contains("m3u8", ignoreCase = true) ||
+            stream.url.contains("hls_playlist", ignoreCase = true)
+        when {
+            mime == "application/x-mpegURL" || isHlsUrl -> itemBuilder.setMimeType("application/x-mpegURL")
+            mime == "application/dash+xml" -> itemBuilder.setMimeType(mime)
         }
 
         controller.setMediaItem(itemBuilder.build())

@@ -203,4 +203,87 @@ class YouTubeMusicProviderTest {
         assertEquals(222_000L, t.durationMs)
         assertEquals("https://lh3.googleusercontent.com/komang-hq", t.artworkUrl)
     }
+
+    @Test
+    fun extractCandidateFromPlayerJson_prefersDirectAudioWhenPreferHlsFalse() {
+        val root = JSONObject(
+            """
+            {
+              "playabilityStatus": { "status": "OK" },
+              "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_playlist/sample.m3u8",
+                "adaptiveFormats": [
+                  {
+                    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "url": "https://rr2.googlevideo.com/direct_m4a",
+                    "bitrate": 130000
+                  }
+                ]
+              }
+            }
+            """.trimIndent()
+        )
+        val res = provider.extractCandidateFromPlayerJson(
+            root = root,
+            userAgent = "test-ua",
+            preferHls = false,
+            resolverName = "InnerTube VISIONOS"
+        )
+        assertNotNull(res)
+        assertEquals("https://rr2.googlevideo.com/direct_m4a", res!!.url)
+        assertEquals("audio/mp4", res.mimeType)
+        assertEquals("InnerTube VISIONOS", res.resolverName)
+    }
+
+    @Test
+    fun extractCandidateFromPlayerJson_prefersHlsWhenPreferHlsTrue() {
+        val root = JSONObject(
+            """
+            {
+              "playabilityStatus": { "status": "OK" },
+              "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_playlist/ios.m3u8",
+                "adaptiveFormats": [
+                  {
+                    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "url": "https://rr2.googlevideo.com/direct_m4a",
+                    "bitrate": 130000
+                  }
+                ]
+              }
+            }
+            """.trimIndent()
+        )
+        val res = provider.extractCandidateFromPlayerJson(
+            root = root,
+            userAgent = "ios-ua",
+            preferHls = true,
+            resolverName = "InnerTube IOS HLS"
+        )
+        assertNotNull(res)
+        assertEquals("https://manifest.googlevideo.com/api/manifest/hls_playlist/ios.m3u8", res!!.url)
+        assertEquals("application/x-mpegURL", res.mimeType)
+    }
+
+    @Test
+    fun extractCandidateFromPlayerJson_rejectsUnplayableStatus() {
+        val root = JSONObject(
+            """
+            {
+              "playabilityStatus": { "status": "LOGIN_REQUIRED" },
+              "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_playlist/blocked.m3u8"
+              }
+            }
+            """.trimIndent()
+        )
+        assertNull(
+            provider.extractCandidateFromPlayerJson(
+                root = root,
+                userAgent = "test-ua",
+                preferHls = true,
+                resolverName = "InnerTube IOS"
+            )
+        )
+    }
 }

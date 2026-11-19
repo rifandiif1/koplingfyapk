@@ -109,7 +109,7 @@ class KoplingfyPlaybackService : MediaLibraryService() {
 
         player.addListener(object : Player.Listener {
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
-                container.equalizerManager.attachToAudioSession(audioSessionId)
+                runCatching { container.equalizerManager.attachToAudioSession(audioSessionId) }
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -129,7 +129,7 @@ class KoplingfyPlaybackService : MediaLibraryService() {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY && player.audioSessionId > 0) {
-                    container.equalizerManager.attachToAudioSession(player.audioSessionId)
+                    runCatching { container.equalizerManager.attachToAudioSession(player.audioSessionId) }
                 }
                 if (playbackState == Player.STATE_ENDED) {
                     container.playbackController.notifyTrackEndedFromService(player.currentMediaItem?.mediaId)
@@ -139,11 +139,12 @@ class KoplingfyPlaybackService : MediaLibraryService() {
         })
 
         if (player.audioSessionId > 0) {
-            container.equalizerManager.attachToAudioSession(player.audioSessionId)
+            runCatching { container.equalizerManager.attachToAudioSession(player.audioSessionId) }
         }
         exoPlayer = player
 
         // ForwardingPlayer so notification, lock-screen, and Bluetooth Next/Prev buttons work with our Auto-Queue
+        // without breaking Media3's Timeline invariants.
         val sessionPlayer = object : androidx.media3.common.ForwardingPlayer(player) {
             override fun getAvailableCommands(): Player.Commands {
                 return super.getAvailableCommands().buildUpon()
@@ -163,9 +164,6 @@ class KoplingfyPlaybackService : MediaLibraryService() {
                     else -> super.isCommandAvailable(command)
                 }
             }
-
-            override fun hasNextMediaItem(): Boolean = true
-            override fun hasPreviousMediaItem(): Boolean = true
 
             override fun seekToNext() {
                 container.playbackController.skipToNext()
