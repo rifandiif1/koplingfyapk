@@ -45,6 +45,8 @@ data class PlaybackUiState(
     val shuffleEnabled: Boolean = false,
     val repeatMode: RepeatModeState = RepeatModeState.OFF,
     val playbackSpeed: Float = 1.0f,
+    val autoQueueEnabled: Boolean = true,
+    val isAutoQueueLoading: Boolean = false,
     val errorMessage: String? = null
 )
 
@@ -65,9 +67,16 @@ class PlaybackController(
     private var mediaController: MediaController? = null
     private var pendingTrackToPlay: Pair<Track, List<Track>>? = null
     private var resolveJob: Job? = null
+    private var autoQueueJob: Job? = null
+    private var prewarmJob: Job? = null
     private var currentStreamAttempt = 0
     private val maxStreamAttempts = 4
     private var suppressLocalBroadcast = false
+
+    // Guards against double-advancing when both Service & MediaController observe STATE_ENDED
+    private var lastHandledEndTrackId: String? = null
+    private var lastHandledEndEpochMs: Long = 0L
+    private var consecutiveAutoSkipFailures: Int = 0
 
     /**
      * Callback invoked ONLY on local user-initiated play/pause/seek/track changes so
@@ -120,6 +129,9 @@ class PlaybackController(
                         positionMs = settings.lastPositionMs,
                         durationMs = last.durationMs
                     )
+                    if (!last.isLiveStream && _state.value.autoQueueEnabled) {
+                        ensureAutoQueueFilled(last, playNextWhenReady = false)
+                    }
                 }
             }
         }
@@ -130,7 +142,9 @@ class PlaybackController(
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _state.value = _state.value.copy(isPlaying = isPlaying)
                 if (isPlaying) {
+                    consecutiveAutoSkipFailures = 0
                     _state.value = _state.value.copy(errorMessage = null)
+                    prewarmNextTrackStream()
                 }
             }
 
@@ -140,7 +154,7 @@ class PlaybackController(
                 _state.value = _state.value.copy(isBuffering = buffering, durationMs = dur)
 
                 if (playbackState == Player.STATE_ENDED) {
-                    handleTrackEnded()
+                    handleTrackEnded(controller.currentMediaItem?.mediaId)
                 }
             }
 
@@ -161,22 +175,38 @@ class PlaybackController(
                             currentStreamAttempt = maxOf(currentStreamAttempt, retryStream.tierIndex + 1)
                             prepareAndStartSingle(controller, cur, retryStream, autoPlay = true)
                         } else {
-                            _state.value = _state.value.copy(
-                                isBuffering = false,
-                                isPlaying = false,
-                                errorMessage = "Gagal memuat stream: ${error.localizedMessage ?: "Coba lagi atau pilih lagu lain"}"
-                            )
+                            handleUnplayableTrack(cur, error.localizedMessage)
                         }
                     }
                 } else {
-                    _state.value = _state.value.copy(
-                        isBuffering = false,
-                        isPlaying = false,
-                        errorMessage = "Gagal memutar audio: ${error.localizedMessage ?: "Periksa koneksi internet"}"
-                    )
+                    handleUnplayableTrack(cur, error.localizedMessage)
                 }
             }
         })
+    }
+
+    private fun handleUnplayableTrack(failedTrack: Track, reason: String?) {
+        val cur = _state.value
+        val hasNextInQueue = cur.queue.size > 1 && (cur.currentIndex + 1 < cur.queue.size || cur.shuffleEnabled)
+        if (hasNextInQueue && consecutiveAutoSkipFailures < 3 && !failedTrack.isLiveStream) {
+            consecutiveAutoSkipFailures++
+            _state.value = cur.copy(
+                isBuffering = true,
+                isPlaying = false,
+                errorMessage = "Gagal memuat ${failedTrack.title}, lanjut ke lagu berikutnya..."
+            )
+            resolveJob?.cancel()
+            resolveJob = scope.launch {
+                delay(700L)
+                skipToNext(isAutoSkip = true)
+            }
+        } else {
+            _state.value = cur.copy(
+                isBuffering = false,
+                isPlaying = false,
+                errorMessage = "Gagal memutar audio: ${reason ?: "Periksa koneksi internet"}"
+            )
+        }
     }
 
     private fun startPositionTicker() {
@@ -200,15 +230,26 @@ class PlaybackController(
         }
     }
 
-    fun playTrack(track: Track, queue: List<Track> = listOf(track), fromRemoteSync: Boolean = false, startPositionMs: Long = 0L, autoPlay: Boolean = true) {
+    fun playTrack(
+        track: Track,
+        queue: List<Track> = listOf(track),
+        fromRemoteSync: Boolean = false,
+        startPositionMs: Long = 0L,
+        autoPlay: Boolean = true,
+        isAutoSkip: Boolean = false
+    ) {
         val controller = mediaController
         if (controller == null) {
             pendingTrackToPlay = track to queue
             connectToService()
             return
         }
+        if (!isAutoSkip) {
+            consecutiveAutoSkipFailures = 0
+        }
         currentStreamAttempt = 0
-        val normalizedQueue = if (queue.any { it.id == track.id }) queue else listOf(track) + queue
+        val dedupedInput = queue.distinctBy { it.id }
+        val normalizedQueue = if (dedupedInput.any { it.id == track.id }) dedupedInput else listOf(track) + dedupedInput
         val idx = normalizedQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
 
         _state.value = _state.value.copy(
@@ -223,6 +264,15 @@ class PlaybackController(
 
         if (!fromRemoteSync && !suppressLocalBroadcast) {
             onLocalPlaybackAction?.invoke(track, autoPlay, startPositionMs)
+        }
+
+        // Immediately build or top up the automatic queue if fewer than 5 upcoming tracks remain
+        if (!track.isLiveStream && !fromRemoteSync && _state.value.autoQueueEnabled) {
+            val remainingUpcoming = normalizedQueue.size - 1 - idx
+            if (remainingUpcoming < 5) {
+                val anchor = normalizedQueue.lastOrNull() ?: track
+                ensureAutoQueueFilled(anchorTrack = anchor, playNextWhenReady = false)
+            }
         }
 
         resolveJob?.cancel()
@@ -241,15 +291,81 @@ class PlaybackController(
             val settings = settingsDataStore.settingsFlow.first()
             val stream = multiSourceRepository.resolvePlayableStream(merged, settings, attempt = 0)
             if (stream == null || stream.url.isBlank()) {
-                _state.value = _state.value.copy(
-                    isBuffering = false,
-                    isPlaying = false,
-                    errorMessage = "Tidak dapat memuat audio untuk ${merged.title}"
-                )
+                handleUnplayableTrack(merged, "Stream tidak tersedia")
                 return@launch
             }
             currentStreamAttempt = stream.tierIndex + 1
             prepareAndStartSingle(controller, merged, stream, autoPlay = autoPlay, startPositionMs = startPositionMs)
+        }
+    }
+
+    /**
+     * Automatically builds and appends related tracks to the queue so playback continues seamlessly
+     * when the current song ends.
+     */
+    private fun ensureAutoQueueFilled(anchorTrack: Track, playNextWhenReady: Boolean) {
+        if (anchorTrack.isLiveStream) return
+        // Avoid cancelling an in-flight auto-queue job unless we now urgently need to play next
+        if (autoQueueJob?.isActive == true && !playNextWhenReady) return
+
+        autoQueueJob?.cancel()
+        autoQueueJob = scope.launch {
+            _state.value = _state.value.copy(isAutoQueueLoading = true)
+            val settings = settingsDataStore.settingsFlow.first()
+            val existingIds = _state.value.queue.map { it.id }.toSet()
+            val related = runCatching {
+                multiSourceRepository.buildAutoQueueTracks(
+                    seedTrack = anchorTrack,
+                    settings = settings,
+                    excludeIds = existingIds,
+                    limit = 15
+                )
+            }.getOrDefault(emptyList())
+
+            val latest = _state.value
+            val currentIds = latest.queue.map { it.id }.toSet()
+            val freshTracks = related.filter { it.id !in currentIds }
+
+            if (freshTracks.isNotEmpty()) {
+                val updatedQueue = latest.queue + freshTracks
+                _state.value = latest.copy(
+                    queue = updatedQueue,
+                    isAutoQueueLoading = false
+                )
+                if (playNextWhenReady) {
+                    val nextIdx = (latest.currentIndex + 1).coerceIn(0, updatedQueue.lastIndex)
+                    playTrack(updatedQueue[nextIdx], updatedQueue)
+                } else {
+                    prewarmNextTrackStream()
+                }
+            } else {
+                _state.value = latest.copy(isAutoQueueLoading = false)
+                // If no new tracks could be fetched online/offline, loop queue smoothly when urgent
+                if (playNextWhenReady && latest.queue.size > 1) {
+                    val nextIdx = (latest.currentIndex + 1) % latest.queue.size
+                    playTrack(latest.queue[nextIdx], latest.queue)
+                }
+            }
+        }
+    }
+
+    /**
+     * Pre-resolves the immediate next track's audio stream in the background so transitioning
+     * at the end of a song is near-instant (cached inside YouTubeMusicProvider for 15 minutes).
+     */
+    private fun prewarmNextTrackStream() {
+        val cur = _state.value
+        val nextIdx = cur.currentIndex + 1
+        val nextTrack = cur.queue.getOrNull(nextIdx) ?: return
+        if (nextTrack.isLiveStream || !nextTrack.localPath.isNullOrBlank()) return
+
+        prewarmJob?.cancel()
+        prewarmJob = scope.launch(Dispatchers.IO) {
+            delay(2_000L) // Let current track stabilize its buffer first
+            val settings = settingsDataStore.settingsFlow.first()
+            runCatching {
+                multiSourceRepository.resolvePlayableStream(nextTrack, settings, attempt = 0)
+            }
         }
     }
 
@@ -349,18 +465,27 @@ class PlaybackController(
         }
     }
 
-    fun skipToNext() {
+    fun skipToNext(isAutoSkip: Boolean = false) {
         val cur = _state.value
         if (cur.queue.isEmpty()) return
         val nextIndex = if (cur.shuffleEnabled && cur.queue.size > 1) {
             (cur.queue.indices - cur.currentIndex).random()
         } else {
             val candidate = cur.currentIndex + 1
-            if (candidate < cur.queue.size) candidate
-            else if (cur.repeatMode == RepeatModeState.ALL) 0
-            else return
+            if (candidate < cur.queue.size) {
+                candidate
+            } else if (cur.repeatMode == RepeatModeState.ALL) {
+                0
+            } else {
+                // Reached end of queue: automatically fetch & play related tracks if Auto-Queue is ON
+                val anchor = cur.currentTrack ?: cur.queue.lastOrNull()
+                if (cur.autoQueueEnabled && anchor != null && !anchor.isLiveStream) {
+                    ensureAutoQueueFilled(anchorTrack = anchor, playNextWhenReady = true)
+                }
+                return
+            }
         }
-        playTrack(cur.queue[nextIndex], cur.queue)
+        playTrack(cur.queue[nextIndex], cur.queue, isAutoSkip = isAutoSkip)
     }
 
     fun skipToPrevious() {
@@ -376,8 +501,28 @@ class PlaybackController(
         playTrack(cur.queue[prevIndex], cur.queue)
     }
 
-    private fun handleTrackEnded() {
+    /**
+     * Called directly by KoplingfyPlaybackService when ExoPlayer finishes a track in the background,
+     * guaranteeing continuous playback even if the UI activity is minimized or destroyed.
+     */
+    fun notifyTrackEndedFromService(endedMediaId: String?) {
+        scope.launch {
+            handleTrackEnded(endedMediaId)
+        }
+    }
+
+    private fun handleTrackEnded(endedMediaId: String?) {
         val cur = _state.value
+        val activeId = cur.currentTrack?.id ?: return
+        if (endedMediaId != null && endedMediaId != activeId) return
+
+        val now = System.currentTimeMillis()
+        if (lastHandledEndTrackId == activeId && (now - lastHandledEndEpochMs) < 2_500L) {
+            return
+        }
+        lastHandledEndTrackId = activeId
+        lastHandledEndEpochMs = now
+
         when (cur.repeatMode) {
             RepeatModeState.ONE -> {
                 mediaController?.seekTo(0L)
@@ -385,9 +530,23 @@ class PlaybackController(
             }
             RepeatModeState.ALL -> skipToNext()
             RepeatModeState.OFF -> {
-                if (cur.currentIndex + 1 < cur.queue.size || cur.shuffleEnabled) {
+                if (cur.currentIndex + 1 < cur.queue.size || (cur.shuffleEnabled && cur.queue.size > 1)) {
                     skipToNext()
+                } else if (cur.autoQueueEnabled && !cur.currentTrack.isLiveStream) {
+                    ensureAutoQueueFilled(anchorTrack = cur.currentTrack, playNextWhenReady = true)
                 }
+            }
+        }
+    }
+
+    fun toggleAutoQueue() {
+        val next = !_state.value.autoQueueEnabled
+        _state.value = _state.value.copy(autoQueueEnabled = next)
+        val cur = _state.value
+        if (next && cur.currentTrack != null && !cur.currentTrack.isLiveStream) {
+            val remaining = cur.queue.size - 1 - cur.currentIndex
+            if (remaining < 5) {
+                ensureAutoQueueFilled(cur.queue.lastOrNull() ?: cur.currentTrack, playNextWhenReady = false)
             }
         }
     }
@@ -460,6 +619,8 @@ class PlaybackController(
     }
 
     fun clearQueue() {
+        autoQueueJob?.cancel()
+        prewarmJob?.cancel()
         mediaController?.stop()
         mediaController?.clearMediaItems()
         _state.value = _state.value.copy(
@@ -467,6 +628,7 @@ class PlaybackController(
             currentTrack = null,
             currentIndex = -1,
             isPlaying = false,
+            isAutoQueueLoading = false,
             positionMs = 0L,
             durationMs = 0L
         )

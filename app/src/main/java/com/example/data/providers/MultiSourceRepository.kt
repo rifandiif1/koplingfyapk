@@ -219,7 +219,71 @@ class MultiSourceRepository(
     }
 
     suspend fun getRelatedTracks(track: Track): List<Track> {
-        val provider = onlineProviders[track.source] ?: audiusProvider
+        val provider = onlineProviders[track.source] ?: youtubeMusicProvider
         return runCatching { provider.getRelatedTracks(track, 12) }.getOrDefault(emptyList())
+    }
+
+    /**
+     * Builds a fresh, deduplicated list of recommended upcoming tracks for Auto-Queue.
+     * Uses YouTube Music's Up Next Radio mix first, tops up from trending if needed,
+     * and falls back to local tracks if offline so playback never stops unexpectedly.
+     */
+    suspend fun buildAutoQueueTracks(
+        seedTrack: Track,
+        settings: AppSettings,
+        excludeIds: Set<String> = emptySet(),
+        limit: Int = 15
+    ): List<Track> {
+        val collected = mutableListOf<Track>()
+        val seenIds = excludeIds.toMutableSet().apply { add(seedTrack.id) }
+        val seenTitles = mutableSetOf<String>().apply {
+            val seedTitle = TrackMetadataNormalizer.normalizeTitle(seedTrack.title)
+            if (seedTitle.isNotBlank()) add(seedTitle)
+        }
+
+        fun absorb(candidates: List<Track>) {
+            for (cand in candidates) {
+                if (collected.size >= limit) break
+                if (cand.isLiveStream) continue
+                if (cand.id in seenIds) continue
+                val norm = TrackMetadataNormalizer.normalizeTitle(cand.title)
+                if (norm.isNotBlank() && norm in seenTitles) continue
+                seenIds.add(cand.id)
+                if (norm.isNotBlank()) seenTitles.add(norm)
+                collected.add(cand)
+            }
+        }
+
+        // 1. Primary provider related tracks (for LOCAL tracks, prefer YouTube Music if enabled, else local siblings)
+        val primaryProvider = when {
+            seedTrack.source in onlineProviders -> onlineProviders[seedTrack.source]
+            MusicSource.YOUTUBE_MUSIC in settings.enabledSources -> youtubeMusicProvider
+            else -> settings.sourcePriorityOrder.firstNotNullOfOrNull {
+                if (it in settings.enabledSources) onlineProviders[it] else null
+            }
+        }
+        if (primaryProvider != null) {
+            val related = runCatching { primaryProvider.getRelatedTracks(seedTrack, limit) }
+                .getOrDefault(emptyList())
+            absorb(related)
+        }
+
+        // 2. Top-up from enabled sources trending if related returned fewer than 5 tracks
+        if (collected.size < 5) {
+            val trending = runCatching { fetchHomeTrending(settings) }.getOrDefault(emptyList())
+            absorb(trending)
+        }
+
+        // 3. Offline / local fallback from cached & local Room library
+        if (collected.size < 3) {
+            val localFallback = runCatching {
+                trackDao.searchTracks("").map { it.toDomain() }
+                    .filter { !it.isLiveStream && (!it.localPath.isNullOrBlank() || it.source != MusicSource.RADIO) }
+                    .shuffled()
+            }.getOrDefault(emptyList())
+            absorb(localFallback)
+        }
+
+        return collected.take(limit)
     }
 }

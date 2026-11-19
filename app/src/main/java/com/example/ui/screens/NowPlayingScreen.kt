@@ -51,11 +51,13 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -578,6 +580,55 @@ fun NowPlayingScreen(
                             showQueueSheet = false
                         }) {
                             Icon(Icons.Rounded.DeleteSweep, contentDescription = "Bersihkan antrean")
+                        }
+                    }
+                }
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Antrean Otomatis (Autoplay)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = if (playbackState.isAutoQueueLoading) {
+                                        "Membuat daftar lagu terkait..."
+                                    } else if (playbackState.autoQueueEnabled) {
+                                        "Otomatis lanjut ke lagu serupa saat selesai"
+                                    } else {
+                                        "Nonaktif — berhenti di akhir antrean"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Switch(
+                                checked = playbackState.autoQueueEnabled,
+                                onCheckedChange = { viewModel.container.playbackController.toggleAutoQueue() },
+                                modifier = Modifier.testTag("queue_auto_queue_switch")
+                            )
+                        }
+                        if (playbackState.isAutoQueueLoading) {
+                            Spacer(Modifier.height(8.dp))
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(3.dp)
+                                    .clip(RoundedCornerShape(50))
+                            )
                         }
                     }
                 }

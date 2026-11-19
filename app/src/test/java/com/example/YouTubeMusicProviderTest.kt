@@ -138,4 +138,69 @@ class YouTubeMusicProviderTest {
         assertEquals(MusicSource.YOUTUBE_MUSIC, track.source)
         assertEquals(false, track.isDownloadable)
     }
+
+    @Test
+    fun extractPlaylistPanelTracks_extractsAutoQueueRadioTracks() {
+        val nextJson = JSONObject(
+            """
+            {
+              "contents": {
+                "singleColumnMusicWatchNextResultsRenderer": {
+                  "tabbedRenderer": {
+                    "watchNextTabbedResultsRenderer": {
+                      "tabs": [
+                        {
+                          "tabRenderer": {
+                            "content": {
+                              "musicQueueRenderer": {
+                                "content": {
+                                  "playlistPanelRenderer": {
+                                    "contents": [
+                                      {
+                                        "playlistPanelVideoRenderer": {
+                                          "videoId": "abc123XYZ89",
+                                          "title": { "runs": [ { "text": "Komang" } ] },
+                                          "longBylineText": {
+                                            "runs": [
+                                              { "text": "Raim Laode" },
+                                              { "text": " • " },
+                                              { "text": "Komang Single" },
+                                              { "text": " • " },
+                                              { "text": "2022" }
+                                            ]
+                                          },
+                                          "lengthText": { "runs": [ { "text": "3:42" } ] },
+                                          "thumbnail": {
+                                            "thumbnails": [
+                                              { "url": "https://lh3.googleusercontent.com/komang-hq" }
+                                            ]
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+            """.trimIndent()
+        )
+
+        val tracks = provider.extractPlaylistPanelTracks(nextJson)
+        assertEquals(1, tracks.size)
+        val t = tracks.first()
+        assertEquals("ytm_abc123XYZ89", t.id)
+        assertEquals("Komang", t.title)
+        assertEquals("Raim Laode", t.artist)
+        assertEquals("Komang Single", t.album)
+        assertEquals(222_000L, t.durationMs)
+        assertEquals("https://lh3.googleusercontent.com/komang-hq", t.artworkUrl)
+    }
 }

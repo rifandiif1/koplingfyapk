@@ -131,6 +131,9 @@ class KoplingfyPlaybackService : MediaLibraryService() {
                 if (playbackState == Player.STATE_READY && player.audioSessionId > 0) {
                     container.equalizerManager.attachToAudioSession(player.audioSessionId)
                 }
+                if (playbackState == Player.STATE_ENDED) {
+                    container.playbackController.notifyTrackEndedFromService(player.currentMediaItem?.mediaId)
+                }
                 updateWidget(player)
             }
         })
@@ -139,6 +142,47 @@ class KoplingfyPlaybackService : MediaLibraryService() {
             container.equalizerManager.attachToAudioSession(player.audioSessionId)
         }
         exoPlayer = player
+
+        // ForwardingPlayer so notification, lock-screen, and Bluetooth Next/Prev buttons work with our Auto-Queue
+        val sessionPlayer = object : androidx.media3.common.ForwardingPlayer(player) {
+            override fun getAvailableCommands(): Player.Commands {
+                return super.getAvailableCommands().buildUpon()
+                    .add(Player.COMMAND_SEEK_TO_NEXT)
+                    .add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+                    .add(Player.COMMAND_SEEK_TO_PREVIOUS)
+                    .add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+                    .build()
+            }
+
+            override fun isCommandAvailable(command: Int): Boolean {
+                return when (command) {
+                    Player.COMMAND_SEEK_TO_NEXT,
+                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_TO_PREVIOUS,
+                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> true
+                    else -> super.isCommandAvailable(command)
+                }
+            }
+
+            override fun hasNextMediaItem(): Boolean = true
+            override fun hasPreviousMediaItem(): Boolean = true
+
+            override fun seekToNext() {
+                container.playbackController.skipToNext()
+            }
+
+            override fun seekToNextMediaItem() {
+                container.playbackController.skipToNext()
+            }
+
+            override fun seekToPrevious() {
+                container.playbackController.skipToPrevious()
+            }
+
+            override fun seekToPreviousMediaItem() {
+                container.playbackController.skipToPrevious()
+            }
+        }
 
         // MediaStyle Notification Provider with Koplingfy channel & branding
         val notificationProvider = DefaultMediaNotificationProvider.Builder(this)
@@ -159,22 +203,17 @@ class KoplingfyPlaybackService : MediaLibraryService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        mediaLibrarySession = MediaLibrarySession.Builder(this, player, LibrarySessionCallback(container))
+        mediaLibrarySession = MediaLibrarySession.Builder(this, sessionPlayer, LibrarySessionCallback(container))
             .setSessionActivity(sessionActivityIntent)
             .build()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val container = (application as KoplingfyApplication).container
         when (intent?.action) {
-            ACTION_TOGGLE_PLAY_PAUSE -> exoPlayer?.let { p ->
-                if (p.isPlaying) p.pause() else p.play()
-            }
-            ACTION_NEXT -> exoPlayer?.let { p ->
-                if (p.hasNextMediaItem()) p.seekToNextMediaItem()
-            }
-            ACTION_PREV -> exoPlayer?.let { p ->
-                if (p.hasPreviousMediaItem()) p.seekToPreviousMediaItem() else p.seekTo(0)
-            }
+            ACTION_TOGGLE_PLAY_PAUSE -> container.playbackController.togglePlayPause()
+            ACTION_NEXT -> container.playbackController.skipToNext()
+            ACTION_PREV -> container.playbackController.skipToPrevious()
         }
         return super.onStartCommand(intent, flags, startId)
     }

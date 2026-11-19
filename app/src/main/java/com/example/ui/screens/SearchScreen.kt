@@ -268,7 +268,7 @@ fun SearchScreen(
                         TrackRowItem(
                             track = track,
                             isPlayingNow = playbackState.currentTrack?.id == track.id,
-                            onClick = { viewModel.playTrack(track, result.tracks) },
+                            onClick = { viewModel.playTrack(track, listOf(track)) },
                             onPlayNext = { viewModel.playNext(track) },
                             onAddToQueue = { viewModel.addToQueue(track) },
                             onAddToPlaylist = { onRequestAddToPlaylist(track) },

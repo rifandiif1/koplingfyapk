@@ -306,7 +306,166 @@ class YouTubeMusicProvider(
     }
 
     override suspend fun getRelatedTracks(track: Track, limit: Int): List<Track> = withContext(Dispatchers.IO) {
-        searchTracks("${track.artist} ${track.title}", limit).filterNot { it.id == track.id }
+        val videoId = track.sourceTrackId.takeIf { it.length == 11 }
+            ?: track.id.removePrefix("ytm_").takeIf { it.length == 11 }
+        val seedNormTitle = TrackMetadataNormalizer.normalizeTitle(track.title)
+
+        val collected = mutableListOf<Track>()
+        val seenIds = mutableSetOf(track.id)
+        val seenNormTitles = mutableSetOf<String>().apply {
+            if (seedNormTitle.isNotBlank()) add(seedNormTitle)
+        }
+
+        fun addUnique(candidates: List<Track>) {
+            for (cand in candidates) {
+                if (collected.size >= limit) break
+                val norm = TrackMetadataNormalizer.normalizeTitle(cand.title)
+                if (cand.id in seenIds) continue
+                if (norm.isNotBlank() && norm in seenNormTitles) continue
+                seenIds.add(cand.id)
+                if (norm.isNotBlank()) seenNormTitles.add(norm)
+                collected.add(cand)
+            }
+        }
+
+        // 1. Primary: Official YouTube Music "Up Next" Radio mix (RDAMVM<videoId>)
+        if (videoId != null) {
+            val radioMix = fetchInnerTubeAutoQueue(videoId, limit + 5)
+            addUnique(radioMix)
+        }
+
+        // 2. Fallback: Related artist/mix tracks via InnerTube search
+        if (collected.size < limit.coerceAtMost(8)) {
+            val query = if (track.artist.isNotBlank() && !track.artist.equals("YouTube Music", ignoreCase = true)) {
+                "${track.artist} songs"
+            } else {
+                "${track.title} mix"
+            }
+            addUnique(searchTracks(query, limit + 5))
+        }
+
+        // 3. Final fallback: Trending charts so auto-queue is never empty
+        if (collected.size < 4) {
+            addUnique(getTrending(limit))
+        }
+
+        collected.take(limit)
+    }
+
+    private fun fetchInnerTubeAutoQueue(videoId: String, limit: Int): List<Track> {
+        val payload = JSONObject().apply {
+            put("videoId", videoId)
+            put("playlistId", "RDAMVM$videoId")
+            put("isAudioOnly", true)
+            put("enablePersistentPlaylistPanel", true)
+            put("tunerSettingValue", "AUTOMIX_SETTING_NORMAL")
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", "1.20250310.01.00")
+                    put("hl", "en")
+                    put("gl", "ID")
+                })
+            })
+        }
+        val body = postInnerTubeWebRemix(
+            "https://music.youtube.com/youtubei/v1/next?prettyPrint=false",
+            payload
+        ) ?: return emptyList()
+        return extractPlaylistPanelTracks(body).take(limit)
+    }
+
+    internal fun extractPlaylistPanelTracks(root: JSONObject): List<Track> {
+        val out = mutableListOf<Track>()
+        val seenIds = mutableSetOf<String>()
+
+        fun walk(node: Any?) {
+            when (node) {
+                is JSONObject -> {
+                    val panelRenderer = node.optJSONObject("playlistPanelVideoRenderer")
+                    if (panelRenderer != null) {
+                        parsePlaylistPanelVideoRenderer(panelRenderer)?.let { t ->
+                            if (seenIds.add(t.sourceTrackId)) out.add(t)
+                        }
+                    }
+                    val keys = node.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (k != "playlistPanelVideoRenderer") {
+                            walk(node.opt(k))
+                        }
+                    }
+                }
+                is JSONArray -> {
+                    for (i in 0 until node.length()) {
+                        walk(node.opt(i))
+                    }
+                }
+            }
+        }
+
+        walk(root)
+        return out
+    }
+
+    private fun parsePlaylistPanelVideoRenderer(renderer: JSONObject): Track? {
+        val videoId = renderer.optString("videoId").trim()
+        if (videoId.length != 11) return null
+
+        val title = renderer.optJSONObject("title")
+            ?.optJSONArray("runs")
+            ?.optJSONObject(0)
+            ?.optString("text")
+            .orEmpty()
+            .trim()
+        if (title.isBlank()) return null
+
+        val bylineRuns = renderer.optJSONObject("longBylineText")?.optJSONArray("runs")
+            ?: renderer.optJSONObject("shortBylineText")?.optJSONArray("runs")
+
+        var artist = "YouTube Music"
+        var album = "YouTube Music"
+        if (bylineRuns != null) {
+            val parts = mutableListOf<String>()
+            for (i in 0 until bylineRuns.length()) {
+                val txt = bylineRuns.optJSONObject(i)?.optString("text").orEmpty().trim()
+                if (txt.isBlank() || txt == "•" || txt == "·" || txt.equals("Song", ignoreCase = true) || txt.equals("Video", ignoreCase = true)) {
+                    continue
+                }
+                if (!Regex("""^\d{4}$""").matches(txt) && !txt.contains("views", ignoreCase = true)) {
+                    parts.add(txt)
+                }
+            }
+            if (parts.isNotEmpty()) artist = parts[0]
+            if (parts.size >= 2) album = parts[1]
+        }
+
+        val lengthText = renderer.optJSONObject("lengthText")
+            ?.optJSONArray("runs")
+            ?.optJSONObject(0)
+            ?.optString("text")
+            .orEmpty()
+            .trim()
+        val durationMs = parseDurationTextToMs(lengthText)
+
+        val thumbs = renderer.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+        val thumbUrl = if (thumbs != null && thumbs.length() > 0) {
+            thumbs.optJSONObject(thumbs.length() - 1)?.optString("url")
+        } else null
+
+        return Track(
+            id = "ytm_$videoId",
+            title = title,
+            artist = artist,
+            album = album,
+            durationMs = durationMs,
+            artworkUrl = thumbUrl?.takeIf { it.startsWith("http") }
+                ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
+            streamUrl = null,
+            source = MusicSource.YOUTUBE_MUSIC,
+            sourceTrackId = videoId,
+            isDownloadable = false
+        )
     }
 
     // =========================================================================
