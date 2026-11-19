@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Koplingfy" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/obsidian_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
+    <style name="Theme.Koplingfy.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/obsidian_bg</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_round</item>
+        <item name="postSplashScreenTheme">@style/Theme.Koplingfy</item>
+    </style>
+</resources>

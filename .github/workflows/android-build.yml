@@ -1,0 +1,72 @@
+name: Koplingfy Android CI/CD Build
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Validate, Test & Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 3. Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 4. Set up Gradle & Restore Cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 5. Prepare Optional .env for Secrets Plugin
+        run: |
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+
+      - name: 6. Validate Project Tasks
+        run: gradle :app:tasks --no-daemon
+
+      - name: 7. Run JVM & Robolectric Unit Tests
+        run: gradle :app:testDebugUnitTest --no-daemon
+
+      - name: 8. Build Debug APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: 9. Decode Signing Keystore & Build Release APK (If Secrets Configured)
+        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
+          export KEYSTORE_PATH="${PWD}/my-upload-key.jks"
+          gradle :app:assembleRelease --no-daemon
+
+      - name: 10. Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koplingfy-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: 11. Upload Release APK Artifact (If Built)
+        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: koplingfy-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn

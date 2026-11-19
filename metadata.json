@@ -1,0 +1,6 @@
+{
+  "name": "Koplingfy",
+  "description": "Advanced multi-source Android music player with Media3 background playback, synced LRCLIB lyrics, ML Kit translation, 5-band equalizer, audio-reactive visualizer, and offline library management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
