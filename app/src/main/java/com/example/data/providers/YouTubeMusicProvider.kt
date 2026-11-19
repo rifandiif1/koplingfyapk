@@ -8,7 +8,13 @@ import com.example.domain.model.ProviderHealthState
 import com.example.domain.model.ProviderStatus
 import com.example.domain.model.Track
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,20 +22,22 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /**
- * Free YouTube Music Catalog & Direct Audio Stream Provider (zero paid API keys).
+ * Fast, Free YouTube Music Catalog & Direct Audio Stream Provider (zero paid API keys).
  *
- * Uses a resilient multi-tier architecture:
- * - Catalog (Search / Charts / Discovery): Direct YouTube Music InnerTube WEB_REMIX API first,
- *   with Piped & Invidious federation fallback.
- * - Audio Stream Resolution (6-tier waterfall):
- *   1. Direct InnerTube ANDROID_VR (direct unencrypted M4A/Opus audio from device IP)
- *   2. Direct InnerTube IOS (direct M4A/Opus + native HLS manifest)
- *   3. Direct InnerTube ANDROID_TESTSUITE
- *   4. Direct InnerTube TVHTML5_SIMPLY_EMBEDDED_PLAYER
- *   5. Live Piped API instances (auto-discovered + user custom gateway)
- *   6. Live Invidious API instances (supports both direct & relative /latest_version proxy URLs)
+ * Engineered for low-latency playback with parallel racing & pre-flight reachability probes:
+ * - Catalog: Direct YouTube Music InnerTube WEB_REMIX API first, with Piped/Invidious fallback.
+ * - Audio Stream Resolution (4 fast parallel tiers + 15-minute stream cache):
+ *   Tier 0: Parallel race of InnerTube ANDROID_VR (direct M4A/Opus) + InnerTube IOS (native HLS + M4A)
+ *   Tier 1: Parallel race of InnerTube IOS_MUSIC + ANDROID_MUSIC + TV_EMBEDDED
+ *   Tier 2: Parallel race of top live Piped & Invidious instances (4.5s timeout cap — never hangs!)
+ *   Tier 3: Parallel race of verified Invidious local audio proxies (/latest_version?local=true)
+ *
+ * Every candidate URL is pre-flight probed (Range: bytes=0-0) with its exact client User-Agent
+ * before being handed to ExoPlayer, eliminating slow multi-tier player errors.
  *
  * Strictly streaming-only (isDownloadable = false).
  */
@@ -42,21 +50,35 @@ class YouTubeMusicProvider(
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
+    // Tight-timeout client dedicated to stream racing & probes so dead mirrors never stall playback
+    private val fastClient: OkHttpClient = httpClient.newBuilder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(4, TimeUnit.SECONDS)
+        .build()
+
+    private val probeClient: OkHttpClient = httpClient.newBuilder()
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(3, TimeUnit.SECONDS)
+        .writeTimeout(3, TimeUnit.SECONDS)
+        .build()
+
     private val webRemixUa =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
     private val androidVrUa =
-        "com.google.android.apps.youtube.vr.exo/1.60.19 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1) gzip"
+        "com.google.android.apps.youtube.vr.exo/1.61.48 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1) gzip"
     private val iosUa =
         "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
-    private val androidTestsuiteUa =
-        "com.google.android.youtube/1.9 (Linux; U; Android 11) gzip"
+    private val iosMusicUa =
+        "com.google.ios.youtubemusic/8.05 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+    private val androidMusicUa =
+        "com.google.android.apps.youtube.music/7.29.52 (Linux; U; Android 14) gzip"
 
     private val defaultPipedInstances = listOf(
         "https://pipedapi.kavin.rocks",
         "https://pipedapi.adminforge.de",
-        "https://pipedapi.r4fo.com",
         "https://api.piped.private.coffee",
-        "https://pipedapi.darkness.services"
+        "https://pipedapi.r4fo.com"
     )
 
     private val defaultInvidiousInstances = listOf(
@@ -65,6 +87,13 @@ class YouTubeMusicProvider(
         "https://invidious.nerdvpn.de",
         "https://iv.datura.network"
     )
+
+    private data class CachedStream(
+        val stream: ResolvedStream,
+        val expiresAtMs: Long
+    )
+
+    private val streamCache = ConcurrentHashMap<String, CachedStream>()
 
     @Volatile
     private var cachedWorkingPiped: String? = null
@@ -84,12 +113,12 @@ class YouTubeMusicProvider(
         cachedWorkingPiped?.let { add(it) }
         addAll(dynamicPipedInstances)
         addAll(defaultPipedInstances)
-    }.distinct()
+    }.distinct().take(6)
 
     private fun invidiousCandidates(): List<String> = buildList {
         addAll(dynamicInvidiousInstances)
         addAll(defaultInvidiousInstances)
-    }.distinct()
+    }.distinct().take(6)
 
     override suspend fun checkHealth(): ProviderStatus = withContext(Dispatchers.IO) {
         val start = System.currentTimeMillis()
@@ -99,19 +128,19 @@ class YouTubeMusicProvider(
             return@withContext ProviderStatus(
                 source = source,
                 enabled = true,
-                priority = 1,
+                priority = 0,
                 health = ProviderHealthState.ONLINE,
-                message = "Direct YouTube Music InnerTube Ready (ANDROID_VR / IOS)",
+                message = "Direct YouTube Music Fast InnerTube Ready",
                 latencyMs = latency
             )
         }
-        val pipedOk = fetchPipedJson("/trending?region=US") != null
+        val pipedOk = fetchPipedJsonFast("/trending?region=ID") != null
         val total = System.currentTimeMillis() - start
         if (pipedOk) {
             ProviderStatus(
                 source = source,
                 enabled = true,
-                priority = 1,
+                priority = 0,
                 health = ProviderHealthState.DEGRADED,
                 message = "Connected via Piped Gateway (${cachedWorkingPiped ?: "auto"})",
                 latencyMs = total
@@ -120,31 +149,28 @@ class YouTubeMusicProvider(
             ProviderStatus(
                 source = source,
                 enabled = true,
-                priority = 1,
+                priority = 0,
                 health = ProviderHealthState.OFFLINE,
-                message = "YouTube Music unreachable — check internet or Piped URL",
+                message = "YouTube Music unreachable — periksa koneksi internet",
                 latencyMs = total
             )
         }
     }
 
     override suspend fun getTrending(limit: Int): List<Track> = withContext(Dispatchers.IO) {
-        // 1. Try direct YouTube Music InnerTube Charts / Top Hits
         val directCharts = fetchInnerTubeCharts(limit)
         if (directCharts.isNotEmpty()) return@withContext directCharts
 
         val directSearch = searchInnerTubeTracks("top hits official audio", limit)
         if (directSearch.isNotEmpty()) return@withContext directSearch
 
-        // 2. Piped fallback
-        val piped = fetchPipedJson("/trending?region=ID") ?: fetchPipedJson("/trending?region=US")
+        val piped = fetchPipedJsonFast("/trending?region=ID") ?: fetchPipedJsonFast("/trending?region=US")
         if (piped != null && piped.startsWith("[")) {
             val list = parsePipedItems(JSONArray(piped)).take(limit)
             if (list.isNotEmpty()) return@withContext list
         }
 
-        // 3. Invidious fallback
-        val inv = fetchInvidiousJson("/api/v1/trending?type=Music&region=US")
+        val inv = fetchInvidiousJsonFast("/api/v1/trending?type=Music&region=US")
         if (inv != null && inv.second.startsWith("[")) {
             return@withContext parseInvidiousItems(JSONArray(inv.second)).take(limit)
         }
@@ -152,25 +178,22 @@ class YouTubeMusicProvider(
     }
 
     override suspend fun getNewReleases(limit: Int): List<Track> =
-        searchTracks("new music release 2025 official audio", limit)
+        searchTracks("new music release official audio", limit)
 
     override suspend fun searchTracks(query: String, limit: Int): List<Track> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
 
-        // 1. Direct YouTube Music InnerTube Search (fast, zero third-party server needed)
         val direct = searchInnerTubeTracks(query, limit)
         if (direct.isNotEmpty()) return@withContext direct
 
-        // 2. Piped API fallback
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val piped = fetchPipedJson("/search?q=$encoded&filter=music_songs")
+        val piped = fetchPipedJsonFast("/search?q=$encoded&filter=music_songs")
         if (piped != null && piped.startsWith("{")) {
             val tracks = parsePipedItems(JSONObject(piped).optJSONArray("items")).take(limit)
             if (tracks.isNotEmpty()) return@withContext tracks
         }
 
-        // 3. Invidious API fallback
-        val inv = fetchInvidiousJson("/api/v1/search?q=$encoded&type=video")
+        val inv = fetchInvidiousJsonFast("/api/v1/search?q=$encoded&type=video")
         if (inv != null && inv.second.startsWith("[")) {
             return@withContext parseInvidiousItems(JSONArray(inv.second)).take(limit)
         }
@@ -179,31 +202,6 @@ class YouTubeMusicProvider(
 
     override suspend fun searchArtists(query: String, limit: Int): List<ArtistItem> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
-        val encoded = URLEncoder.encode(query, "UTF-8")
-        val piped = fetchPipedJson("/search?q=$encoded&filter=music_artists")
-        if (piped != null && piped.startsWith("{")) {
-            val items = JSONObject(piped).optJSONArray("items")
-            if (items != null) {
-                return@withContext buildList {
-                    for (i in 0 until minOf(items.length(), limit)) {
-                        val obj = items.optJSONObject(i) ?: continue
-                        val name = obj.optString("name")
-                        val url = obj.optString("url")
-                        if (name.isBlank()) continue
-                        add(
-                            ArtistItem(
-                                id = "ytm_artist_${url.substringAfterLast('/')}",
-                                name = name,
-                                artworkUrl = obj.optString("thumbnail").takeIf { it.isNotBlank() },
-                                source = MusicSource.YOUTUBE_MUSIC,
-                                followerCount = obj.optInt("subscribers", 0).coerceAtLeast(0)
-                            )
-                        )
-                    }
-                }
-            }
-        }
-        // Fallback: derive unique artists from direct InnerTube track search
         searchInnerTubeTracks(query, limit * 2)
             .distinctBy { it.artist.lowercase() }
             .take(limit)
@@ -219,34 +217,26 @@ class YouTubeMusicProvider(
 
     override suspend fun searchAlbums(query: String, limit: Int): List<AlbumItem> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
-        val encoded = URLEncoder.encode(query, "UTF-8")
-        val piped = fetchPipedJson("/search?q=$encoded&filter=music_albums") ?: return@withContext emptyList()
-        if (!piped.startsWith("{")) return@withContext emptyList()
-        val items = JSONObject(piped).optJSONArray("items") ?: return@withContext emptyList()
-        buildList {
-            for (i in 0 until minOf(items.length(), limit)) {
-                val obj = items.optJSONObject(i) ?: continue
-                val title = obj.optString("name")
-                val url = obj.optString("url")
-                if (title.isBlank()) continue
-                add(
-                    AlbumItem(
-                        id = "ytm_album_${url.substringAfterLast('=')}",
-                        title = title,
-                        artist = obj.optString("uploaderName").ifBlank { "YouTube Music" },
-                        artworkUrl = obj.optString("thumbnail").takeIf { it.isNotBlank() },
-                        source = MusicSource.YOUTUBE_MUSIC,
-                        trackCount = obj.optInt("videos", 0).coerceAtLeast(0)
-                    )
+        searchInnerTubeTracks(query, limit * 2)
+            .filter { it.album.isNotBlank() && it.album != "YouTube Music" }
+            .distinctBy { it.album.lowercase() }
+            .take(limit)
+            .map { t ->
+                AlbumItem(
+                    id = "ytm_album_${t.album.hashCode()}",
+                    title = t.album,
+                    artist = t.artist,
+                    artworkUrl = t.artworkUrl,
+                    source = MusicSource.YOUTUBE_MUSIC,
+                    trackCount = 1
                 )
             }
-        }
     }
 
     override suspend fun searchPlaylists(query: String, limit: Int): List<PlaylistSummary> = withContext(Dispatchers.IO) {
         if (query.isBlank()) return@withContext emptyList()
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val piped = fetchPipedJson("/search?q=$encoded&filter=music_playlists") ?: return@withContext emptyList()
+        val piped = fetchPipedJsonFast("/search?q=$encoded&filter=music_playlists") ?: return@withContext emptyList()
         if (!piped.startsWith("{")) return@withContext emptyList()
         val items = JSONObject(piped).optJSONArray("items") ?: return@withContext emptyList()
         buildList {
@@ -273,57 +263,159 @@ class YouTubeMusicProvider(
         resolveStream(track, attempt = 0)?.url
 
     /**
-     * Multi-tier YouTube audio stream resolver.
-     * Each retry attempt starts further down the waterfall so HTTP 403 / expired streams recover seamlessly.
+     * Fast parallel stream resolver with pre-flight verification & 15-minute cache.
+     * Never blocks sequentially on dead mirrors.
      */
     override suspend fun resolveStream(track: Track, attempt: Int): ResolvedStream? = withContext(Dispatchers.IO) {
         val videoId = track.sourceTrackId.takeIf { it.isNotBlank() }
             ?: track.id.removePrefix("ytm_")
         if (videoId.isBlank()) return@withContext null
 
-        val resolvers: List<suspend () -> ResolvedStream?> = listOf(
-            // Tier 1: Direct InnerTube ANDROID_VR (direct unencrypted M4A/Opus audio from user's own IP)
-            { resolveViaInnerTubeAndroidVr(videoId) },
-            // Tier 2: Direct InnerTube IOS (direct M4A/Opus + native HLS manifest)
-            { resolveViaInnerTubeIos(videoId) },
-            // Tier 3: Direct InnerTube ANDROID_TESTSUITE
-            { resolveViaInnerTubeAndroidTestsuite(videoId) },
-            // Tier 4: Direct InnerTube TVHTML5_SIMPLY_EMBEDDED_PLAYER
-            { resolveViaInnerTubeTvEmbedded(videoId) },
-            // Tier 5: Piped Federation (refreshes public instance directory automatically if needed)
-            { resolveViaPiped(videoId) },
-            // Tier 6: Invidious Federation (supports direct URL + local proxy /latest_version)
-            { resolveViaInvidious(videoId) }
+        val now = System.currentTimeMillis()
+        if (attempt == 0) {
+            val cached = streamCache[videoId]
+            if (cached != null && cached.expiresAtMs > now) {
+                return@withContext cached.stream
+            }
+        } else {
+            // Invalidate stale cache if ExoPlayer reported an error and triggered a retry
+            streamCache.remove(videoId)
+        }
+
+        val tiers: List<suspend () -> ResolvedStream?> = listOf(
+            // Tier 0: Race ANDROID_VR (direct M4A/Opus) + IOS (HLS + direct M4A) concurrently (max 5.5s)
+            { raceTier0PrimaryInnerTube(videoId) },
+            // Tier 1: Race IOS_MUSIC + ANDROID_MUSIC + TV_EMBEDDED concurrently (max 5s)
+            { raceTier1SecondaryInnerTube(videoId) },
+            // Tier 2: Race top Piped & Invidious mirrors concurrently (max 5s)
+            { raceTier2FederationMirrors(videoId) },
+            // Tier 3: Race verified Invidious local audio proxies concurrently (max 4.5s)
+            { raceTier3InvidiousProxy(videoId) }
         )
 
-        val startIdx = attempt.coerceIn(0, resolvers.lastIndex)
-        for (i in startIdx until resolvers.size) {
-            val resolved = runCatching { resolvers[i]() }.getOrNull()
+        val startIdx = attempt.coerceIn(0, tiers.lastIndex)
+        for (tierIdx in startIdx until tiers.size) {
+            val resolved = runCatching { tiers[tierIdx]() }.getOrNull()
             if (resolved != null && resolved.url.startsWith("http")) {
-                return@withContext resolved.copy(tierIndex = i)
+                val tagged = resolved.copy(tierIndex = tierIdx)
+                streamCache[videoId] = CachedStream(tagged, now + 15 * 60_000L)
+                return@withContext tagged
             }
         }
         null
     }
 
     override suspend fun getRelatedTracks(track: Track, limit: Int): List<Track> = withContext(Dispatchers.IO) {
-        val pipedBody = fetchPipedJson("/streams/${track.sourceTrackId}")
-        if (pipedBody != null && pipedBody.startsWith("{")) {
-            val related = JSONObject(pipedBody).optJSONArray("relatedStreams")
-            val tracks = parsePipedItems(related).take(limit)
-            if (tracks.isNotEmpty()) return@withContext tracks
-        }
         searchTracks("${track.artist} ${track.title}", limit).filterNot { it.id == track.id }
+    }
+
+    // =========================================================================
+    // PARALLEL TIER RACING ENGINE (SUB-2s TYPICAL RESOLUTION, ZERO HANGS)
+    // =========================================================================
+
+    private suspend fun raceFirstValid(
+        timeoutMs: Long,
+        tasks: List<suspend () -> ResolvedStream?>
+    ): ResolvedStream? = withTimeoutOrNull(timeoutMs) {
+        coroutineScope {
+            val winner = Channel<ResolvedStream>(Channel.CONFLATED)
+            val jobs = tasks.map { block ->
+                launch(Dispatchers.IO) {
+                    val res = runCatching { block() }.getOrNull()
+                    if (res != null && res.url.startsWith("http")) {
+                        winner.trySend(res)
+                    }
+                }
+            }
+            launch {
+                jobs.forEach { it.join() }
+                winner.close()
+            }
+            val result = winner.receiveCatching().getOrNull()
+            jobs.forEach { it.cancel() }
+            result
+        }
+    }
+
+    private suspend fun raceTier0PrimaryInnerTube(videoId: String): ResolvedStream? {
+        val vd = getOrFetchVisitorDataFast()
+        return raceFirstValid(
+            timeoutMs = 5_500L,
+            tasks = listOf(
+                { resolveViaInnerTubeIos(videoId, vd, preferHls = true) },
+                { resolveViaInnerTubeAndroidVr(videoId, vd) },
+                { resolveViaInnerTubeIos(videoId, vd, preferHls = false) }
+            )
+        )
+    }
+
+    private suspend fun raceTier1SecondaryInnerTube(videoId: String): ResolvedStream? {
+        val vd = getOrFetchVisitorDataFast()
+        return raceFirstValid(
+            timeoutMs = 5_000L,
+            tasks = listOf(
+                { resolveViaInnerTubeIosMusic(videoId, vd) },
+                { resolveViaInnerTubeAndroidMusic(videoId, vd) },
+                { resolveViaInnerTubeTvEmbedded(videoId, vd) }
+            )
+        )
+    }
+
+    private suspend fun raceTier2FederationMirrors(videoId: String): ResolvedStream? {
+        // Refresh directory quickly in background if empty
+        if (dynamicPipedInstances.isEmpty() && dynamicInvidiousInstances.isEmpty()) {
+            withTimeoutOrNull(2_000L) { refreshPublicInstancesFast() }
+        }
+        val pipedTasks = pipedCandidates().take(4).map<String, suspend () -> ResolvedStream?> { base ->
+            { resolveSinglePipedInstance(base, videoId) }
+        }
+        val invTasks = invidiousCandidates().take(4).map<String, suspend () -> ResolvedStream?> { base ->
+            { resolveSingleInvidiousInstance(base, videoId) }
+        }
+        return raceFirstValid(timeoutMs = 5_000L, tasks = pipedTasks + invTasks)
+    }
+
+    private suspend fun raceTier3InvidiousProxy(videoId: String): ResolvedStream? {
+        val tasks = invidiousCandidates().take(4).map<String, suspend () -> ResolvedStream?> { base ->
+            {
+                val proxyUrl = "$base/latest_version?id=$videoId&itag=140&local=true"
+                if (isStreamReachable(proxyUrl, webRemixUa)) {
+                    ResolvedStream(
+                        url = proxyUrl,
+                        userAgent = webRemixUa,
+                        mimeType = "audio/mp4",
+                        resolverName = "Invidious Proxy"
+                    )
+                } else null
+            }
+        }
+        return raceFirstValid(timeoutMs = 4_500L, tasks = tasks)
+    }
+
+    /**
+     * Lightweight pre-flight check (Range: bytes=0-0) confirming googlevideo/mirror does NOT return 403/404.
+     * Prevents handing broken URLs to ExoPlayer and wasting seconds cycling errors.
+     */
+    private fun isStreamReachable(url: String, userAgent: String): Boolean {
+        return runCatching {
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .header("Range", "bytes=0-0")
+                .get()
+                .build()
+            probeClient.newCall(req).execute().use { resp ->
+                resp.code in 200..299
+            }
+        }.getOrDefault(false)
     }
 
     // =========================================================================
     // DIRECT YOUTUBE INNERTUBE PLAYER RESOLVERS (ZERO API KEY, DEVICE IP)
     // =========================================================================
 
-    private fun getOrFetchVisitorData(): String? {
+    private fun getOrFetchVisitorDataFast(): String? {
         cachedVisitorData?.takeIf { it.isNotBlank() }?.let { return it }
-
-        // 1. Primary: YouTube Music visitor_id endpoint
         runCatching {
             val payload = JSONObject().apply {
                 put("context", JSONObject().apply {
@@ -343,7 +435,7 @@ class YouTubeMusicProvider(
                 .header("X-YouTube-Client-Version", "1.20250310.01.00")
                 .post(payload.toString().toRequestBody(jsonMediaType))
                 .build()
-            httpClient.newCall(req).execute().use { resp ->
+            fastClient.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
                     val body = resp.body?.string().orEmpty()
                     if (body.startsWith("{")) {
@@ -359,30 +451,10 @@ class YouTubeMusicProvider(
                 }
             }
         }
-
-        // 2. Fallback: YouTube sw.js_data visitor cookie token
-        runCatching {
-            val req = Request.Builder()
-                .url("https://www.youtube.com/sw.js_data")
-                .header("User-Agent", webRemixUa)
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val txt = resp.body?.string().orEmpty()
-                    val match = Regex(""""(Cgt[A-Za-z0-9_%-]{10,})"""").find(txt)
-                    val vd = match?.groupValues?.getOrNull(1).orEmpty()
-                    if (vd.isNotBlank()) {
-                        cachedVisitorData = vd
-                        return vd
-                    }
-                }
-            }
-        }
-        return null
+        return cachedVisitorData
     }
 
-    private fun resolveViaInnerTubeAndroidVr(videoId: String): ResolvedStream? {
-        val visitorData = getOrFetchVisitorData()
+    private fun resolveViaInnerTubeAndroidVr(videoId: String, visitorData: String?): ResolvedStream? {
         val payload = JSONObject().apply {
             put("videoId", videoId)
             put("contentCheckOk", true)
@@ -402,19 +474,24 @@ class YouTubeMusicProvider(
                 })
             })
         }
-        return postInnerTubePlayer(
+        return postInnerTubePlayerFast(
+            endpoint = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
             payload = payload,
             userAgent = androidVrUa,
             clientNameHeader = "28",
             clientVersionHeader = "1.61.48",
             visitorData = visitorData,
             isWebClient = false,
+            preferHls = false,
             resolverName = "InnerTube ANDROID_VR"
         )
     }
 
-    private fun resolveViaInnerTubeIos(videoId: String): ResolvedStream? {
-        val visitorData = getOrFetchVisitorData()
+    private fun resolveViaInnerTubeIos(
+        videoId: String,
+        visitorData: String?,
+        preferHls: Boolean
+    ): ResolvedStream? {
         val payload = JSONObject().apply {
             put("videoId", videoId)
             put("contentCheckOk", true)
@@ -433,47 +510,81 @@ class YouTubeMusicProvider(
                 })
             })
         }
-        return postInnerTubePlayer(
+        return postInnerTubePlayerFast(
+            endpoint = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
             payload = payload,
             userAgent = iosUa,
             clientNameHeader = "5",
             clientVersionHeader = "20.10.4",
             visitorData = visitorData,
             isWebClient = false,
-            resolverName = "InnerTube IOS"
+            preferHls = preferHls,
+            resolverName = if (preferHls) "InnerTube IOS HLS" else "InnerTube IOS"
         )
     }
 
-    private fun resolveViaInnerTubeAndroidTestsuite(videoId: String): ResolvedStream? {
-        val visitorData = getOrFetchVisitorData()
+    private fun resolveViaInnerTubeIosMusic(videoId: String, visitorData: String?): ResolvedStream? {
         val payload = JSONObject().apply {
             put("videoId", videoId)
             put("contentCheckOk", true)
             put("racyCheckOk", true)
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
-                    put("clientName", "ANDROID_TESTSUITE")
-                    put("clientVersion", "1.9")
-                    put("androidSdkVersion", 30)
+                    put("clientName", "IOS_MUSIC")
+                    put("clientVersion", "8.05")
+                    put("deviceMake", "Apple")
+                    put("deviceModel", "iPhone16,2")
+                    put("osName", "iPhone")
+                    put("osVersion", "18.3.2.22D82")
                     put("hl", "en")
                     put("gl", "US")
                     if (!visitorData.isNullOrBlank()) put("visitorData", visitorData)
                 })
             })
         }
-        return postInnerTubePlayer(
+        return postInnerTubePlayerFast(
+            endpoint = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false",
             payload = payload,
-            userAgent = androidTestsuiteUa,
-            clientNameHeader = "30",
-            clientVersionHeader = "1.9",
+            userAgent = iosMusicUa,
+            clientNameHeader = "26",
+            clientVersionHeader = "8.05",
             visitorData = visitorData,
             isWebClient = false,
-            resolverName = "InnerTube ANDROID_TESTSUITE"
+            preferHls = true,
+            resolverName = "InnerTube IOS_MUSIC"
         )
     }
 
-    private fun resolveViaInnerTubeTvEmbedded(videoId: String): ResolvedStream? {
-        val visitorData = getOrFetchVisitorData()
+    private fun resolveViaInnerTubeAndroidMusic(videoId: String, visitorData: String?): ResolvedStream? {
+        val payload = JSONObject().apply {
+            put("videoId", videoId)
+            put("contentCheckOk", true)
+            put("racyCheckOk", true)
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "ANDROID_MUSIC")
+                    put("clientVersion", "7.29.52")
+                    put("androidSdkVersion", 34)
+                    put("hl", "en")
+                    put("gl", "US")
+                    if (!visitorData.isNullOrBlank()) put("visitorData", visitorData)
+                })
+            })
+        }
+        return postInnerTubePlayerFast(
+            endpoint = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false",
+            payload = payload,
+            userAgent = androidMusicUa,
+            clientNameHeader = "21",
+            clientVersionHeader = "7.29.52",
+            visitorData = visitorData,
+            isWebClient = false,
+            preferHls = false,
+            resolverName = "InnerTube ANDROID_MUSIC"
+        )
+    }
+
+    private fun resolveViaInnerTubeTvEmbedded(videoId: String, visitorData: String?): ResolvedStream? {
         val payload = JSONObject().apply {
             put("videoId", videoId)
             put("contentCheckOk", true)
@@ -491,100 +602,115 @@ class YouTubeMusicProvider(
                 })
             })
         }
-        return postInnerTubePlayer(
+        return postInnerTubePlayerFast(
+            endpoint = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
             payload = payload,
             userAgent = webRemixUa,
             clientNameHeader = "85",
             clientVersionHeader = "2.0",
             visitorData = visitorData,
             isWebClient = true,
+            preferHls = false,
             resolverName = "InnerTube TV_EMBEDDED"
         )
     }
 
-    private fun postInnerTubePlayer(
+    private fun postInnerTubePlayerFast(
+        endpoint: String,
         payload: JSONObject,
         userAgent: String,
         clientNameHeader: String,
         clientVersionHeader: String,
         visitorData: String?,
         isWebClient: Boolean,
+        preferHls: Boolean,
         resolverName: String
     ): ResolvedStream? {
-        val endpoints = listOf(
-            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-            "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
-        )
-        for (endpoint in endpoints) {
-            val resolved = runCatching {
-                val reqBuilder = Request.Builder()
-                    .url(endpoint)
-                    .header("User-Agent", userAgent)
-                    .header("X-YouTube-Client-Name", clientNameHeader)
-                    .header("X-YouTube-Client-Version", clientVersionHeader)
-                    .header("X-Goog-Api-Format-Version", "2")
-                    .header("Accept", "application/json")
-                    .post(payload.toString().toRequestBody(jsonMediaType))
+        return runCatching {
+            val reqBuilder = Request.Builder()
+                .url(endpoint)
+                .header("User-Agent", userAgent)
+                .header("X-YouTube-Client-Name", clientNameHeader)
+                .header("X-YouTube-Client-Version", clientVersionHeader)
+                .header("X-Goog-Api-Format-Version", "2")
+                .header("Accept", "application/json")
+                .post(payload.toString().toRequestBody(jsonMediaType))
 
-                if (!visitorData.isNullOrBlank()) {
-                    reqBuilder.header("X-Goog-Visitor-Id", visitorData)
+            if (!visitorData.isNullOrBlank()) {
+                reqBuilder.header("X-Goog-Visitor-Id", visitorData)
+            }
+            if (isWebClient) {
+                reqBuilder.header("Origin", "https://www.youtube.com")
+                reqBuilder.header("Referer", "https://www.youtube.com/")
+            }
+
+            fastClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                if (!body.startsWith("{")) return@use null
+                val root = JSONObject(body)
+                val status = root.optJSONObject("playabilityStatus")?.optString("status")
+                if (status != null && status != "OK" && status != "LIVE_STREAM_OFFLINE") {
+                    return@use null
                 }
-                if (isWebClient) {
-                    reqBuilder.header("Origin", "https://www.youtube.com")
-                    reqBuilder.header("Referer", "https://www.youtube.com/")
-                }
+                val streamingData = root.optJSONObject("streamingData") ?: return@use null
 
-                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use null
-                    val body = resp.body?.string().orEmpty()
-                    if (!body.startsWith("{")) return@use null
-                    val root = JSONObject(body)
-                    val status = root.optJSONObject("playabilityStatus")?.optString("status")
-                    if (status != null && status != "OK" && status != "LIVE_STREAM_OFFLINE") {
-                        return@use null
-                    }
-                    val streamingData = root.optJSONObject("streamingData") ?: return@use null
-
-                    // 1. Prefer best direct non-DRM audio-only adaptive format (M4A itag 140/141 or Opus itag 251/250)
-                    val adaptive = streamingData.optJSONArray("adaptiveFormats")
-                    val bestAdaptive = pickBestDirectAudioFormat(adaptive)
-                    if (bestAdaptive != null) {
-                        return@use ResolvedStream(
-                            url = bestAdaptive.first,
-                            userAgent = userAgent,
-                            mimeType = bestAdaptive.second,
-                            resolverName = resolverName
-                        )
-                    }
-
-                    // 2. Fallback to muxed formats (itag 18 MP4 — always playable by ExoPlayer)
-                    val muxed = streamingData.optJSONArray("formats")
-                    val bestMuxed = pickBestDirectMuxedFormat(muxed)
-                    if (bestMuxed != null) {
-                        return@use ResolvedStream(
-                            url = bestMuxed.first,
-                            userAgent = userAgent,
-                            mimeType = bestMuxed.second,
-                            resolverName = "$resolverName (Muxed)"
-                        )
-                    }
-
-                    // 3. Fallback to HLS Manifest URL (native Media3 ExoPlayer HLS playback)
-                    val hls = streamingData.optString("hlsManifestUrl")
-                    if (hls.startsWith("http")) {
-                        return@use ResolvedStream(
+                // Build ordered candidate list: HLS first if preferHls, else direct M4A/Opus -> Muxed -> HLS
+                val candidates = mutableListOf<ResolvedStream>()
+                val hls = streamingData.optString("hlsManifestUrl")
+                if (preferHls && hls.startsWith("http")) {
+                    candidates.add(
+                        ResolvedStream(
                             url = hls,
                             userAgent = userAgent,
                             mimeType = "application/x-mpegURL",
                             resolverName = "$resolverName (HLS)"
                         )
-                    }
-                    null
+                    )
                 }
-            }.getOrNull()
-            if (resolved != null) return resolved
-        }
-        return null
+
+                pickBestDirectAudioFormat(streamingData.optJSONArray("adaptiveFormats"))?.let { (url, mime) ->
+                    candidates.add(
+                        ResolvedStream(
+                            url = url,
+                            userAgent = userAgent,
+                            mimeType = mime,
+                            resolverName = resolverName
+                        )
+                    )
+                }
+
+                pickBestDirectMuxedFormat(streamingData.optJSONArray("formats"))?.let { (url, mime) ->
+                    candidates.add(
+                        ResolvedStream(
+                            url = url,
+                            userAgent = userAgent,
+                            mimeType = mime,
+                            resolverName = "$resolverName (Muxed)"
+                        )
+                    )
+                }
+
+                if (!preferHls && hls.startsWith("http")) {
+                    candidates.add(
+                        ResolvedStream(
+                            url = hls,
+                            userAgent = userAgent,
+                            mimeType = "application/x-mpegURL",
+                            resolverName = "$resolverName (HLS)"
+                        )
+                    )
+                }
+
+                // Probe candidate URLs with exact UA before returning so ExoPlayer plays on first try!
+                for (cand in candidates) {
+                    if (isStreamReachable(cand.url, userAgent)) {
+                        return@use cand
+                    }
+                }
+                null
+            }
+        }.getOrNull()
     }
 
     internal fun pickBestDirectAudioFormat(formats: JSONArray?): Pair<String, String>? {
@@ -601,7 +727,6 @@ class YouTubeMusicProvider(
             val url = obj.optString("url")
             if (!url.startsWith("http")) continue
             val bitrate = obj.optInt("bitrate", obj.optInt("averageBitrate", 0))
-            // Prefer AAC/M4A (universal Android MediaCodec) then Opus/WebM
             val codecBonus = when {
                 mime.contains("mp4") || mime.contains("mp4a") -> 200_000
                 mime.contains("opus") || mime.contains("webm") -> 100_000
@@ -621,6 +746,7 @@ class YouTubeMusicProvider(
         if (formats == null) return null
         for (i in 0 until formats.length()) {
             val obj = formats.optJSONObject(i) ?: continue
+            if (obj.has("drmFamilies")) continue
             val url = obj.optString("url")
             if (url.startsWith("http")) {
                 val mime = obj.optString("mimeType").substringBefore(";").ifBlank { "video/mp4" }
@@ -637,7 +763,7 @@ class YouTubeMusicProvider(
     private fun searchInnerTubeTracks(query: String, limit: Int): List<Track> {
         val payload = JSONObject().apply {
             put("query", query)
-            put("params", "EgWKAQIIAWoMEAMQBBAJEAoQBRAV") // Songs filter on YouTube Music
+            put("params", "EgWKAQIIAWoMEAMQBBAJEAoQBRAV")
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
                     put("clientName", "WEB_REMIX")
@@ -681,7 +807,7 @@ class YouTubeMusicProvider(
                 .header("Accept", "application/json")
                 .post(payload.toString().toRequestBody(jsonMediaType))
                 .build()
-            httpClient.newCall(req).execute().use { resp ->
+            fastClient.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
                     val txt = resp.body?.string().orEmpty()
                     if (txt.startsWith("{")) JSONObject(txt) else null
@@ -808,18 +934,18 @@ class YouTubeMusicProvider(
     }
 
     // =========================================================================
-    // PIPED & INVIDIOUS FEDERATION FALLBACKS
+    // FAST PARALLEL PIPED & INVIDIOUS FEDERATION FALLBACKS
     // =========================================================================
 
-    private fun refreshPublicInstancesIfNeeded() {
-        if (dynamicPipedInstances.isEmpty()) {
+    private suspend fun refreshPublicInstancesFast() = coroutineScope {
+        val pipedJob = async(Dispatchers.IO) {
             runCatching {
                 val req = Request.Builder().url("https://piped-instances.kavin.rocks/").build()
-                httpClient.newCall(req).execute().use { resp ->
+                probeClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val arr = JSONArray(resp.body?.string().orEmpty())
                         dynamicPipedInstances = buildList {
-                            for (i in 0 until minOf(arr.length(), 10)) {
+                            for (i in 0 until minOf(arr.length(), 6)) {
                                 val apiUrl = arr.optJSONObject(i)?.optString("api_url")?.trimEnd('/')
                                 if (!apiUrl.isNullOrBlank() && apiUrl.startsWith("https://")) add(apiUrl)
                             }
@@ -828,14 +954,14 @@ class YouTubeMusicProvider(
                 }
             }
         }
-        if (dynamicInvidiousInstances.isEmpty()) {
+        val invJob = async(Dispatchers.IO) {
             runCatching {
                 val req = Request.Builder().url("https://api.invidious.io/instances.json?sort_by=health").build()
-                httpClient.newCall(req).execute().use { resp ->
+                probeClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val arr = JSONArray(resp.body?.string().orEmpty())
                         dynamicInvidiousInstances = buildList {
-                            for (i in 0 until minOf(arr.length(), 10)) {
+                            for (i in 0 until minOf(arr.length(), 6)) {
                                 val pair = arr.optJSONArray(i) ?: continue
                                 val meta = pair.optJSONObject(1) ?: continue
                                 if (meta.optBoolean("api", false)) {
@@ -848,58 +974,64 @@ class YouTubeMusicProvider(
                 }
             }
         }
+        awaitAll(pipedJob, invJob)
     }
 
-    private suspend fun resolveViaPiped(videoId: String): ResolvedStream? {
-        val body = fetchPipedJson("/streams/$videoId") ?: run {
-            refreshPublicInstancesIfNeeded()
-            fetchPipedJson("/streams/$videoId")
-        } ?: return null
-
-        if (!body.startsWith("{")) return null
-        val root = JSONObject(body)
-        val audioStreams = root.optJSONArray("audioStreams")
-        val bestUrl = selectBestAudioStream(audioStreams, urlKey = "url", bitrateKey = "bitrate")
-        if (bestUrl != null) {
-            return ResolvedStream(url = bestUrl, resolverName = "Piped Gateway")
-        }
-        val hls = root.optString("hls")
-        if (hls.startsWith("http")) {
-            return ResolvedStream(url = hls, mimeType = "application/x-mpegURL", resolverName = "Piped HLS")
-        }
-        return null
+    private fun resolveSinglePipedInstance(base: String, videoId: String): ResolvedStream? {
+        return runCatching {
+            val req = Request.Builder()
+                .url("$base/streams/$videoId")
+                .header("Accept", "application/json")
+                .build()
+            fastClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                if (!body.startsWith("{")) return@use null
+                cachedWorkingPiped = base
+                val root = JSONObject(body)
+                val bestUrl = selectBestAudioStream(root.optJSONArray("audioStreams"), "url", "bitrate")
+                if (bestUrl != null && isStreamReachable(bestUrl, webRemixUa)) {
+                    return@use ResolvedStream(url = bestUrl, userAgent = webRemixUa, resolverName = "Piped Gateway")
+                }
+                val hls = root.optString("hls")
+                if (hls.startsWith("http") && isStreamReachable(hls, webRemixUa)) {
+                    return@use ResolvedStream(
+                        url = hls,
+                        userAgent = webRemixUa,
+                        mimeType = "application/x-mpegURL",
+                        resolverName = "Piped HLS"
+                    )
+                }
+                null
+            }
+        }.getOrNull()
     }
 
-    private suspend fun resolveViaInvidious(videoId: String): ResolvedStream? {
-        val inv = fetchInvidiousJson("/api/v1/videos/$videoId") ?: run {
-            refreshPublicInstancesIfNeeded()
-            fetchInvidiousJson("/api/v1/videos/$videoId")
-        } ?: return null
-
-        val (baseUrl, body) = inv
-        if (!body.startsWith("{")) return null
-        val root = JSONObject(body)
-        val adaptive = root.optJSONArray("adaptiveFormats")
-        val bestUrl = selectBestInvidiousAudio(adaptive, baseUrl)
-        if (bestUrl != null) {
-            return ResolvedStream(url = bestUrl, resolverName = "Invidious Gateway")
-        }
-        // Fallback to Invidious local audio proxy endpoint (itag 140 = M4A audio)
-        return ResolvedStream(
-            url = "$baseUrl/latest_version?id=$videoId&itag=140&local=true",
-            mimeType = "audio/mp4",
-            resolverName = "Invidious Proxy"
-        )
+    private fun resolveSingleInvidiousInstance(base: String, videoId: String): ResolvedStream? {
+        return runCatching {
+            val req = Request.Builder()
+                .url("$base/api/v1/videos/$videoId")
+                .header("Accept", "application/json")
+                .build()
+            fastClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                if (!body.startsWith("{")) return@use null
+                val root = JSONObject(body)
+                val bestUrl = selectBestInvidiousAudio(root.optJSONArray("adaptiveFormats"), base)
+                if (bestUrl != null && isStreamReachable(bestUrl, webRemixUa)) {
+                    return@use ResolvedStream(url = bestUrl, userAgent = webRemixUa, resolverName = "Invidious Gateway")
+                }
+                null
+            }
+        }.getOrNull()
     }
 
-    private suspend fun fetchPipedJson(path: String): String? = withContext(Dispatchers.IO) {
-        for (base in pipedCandidates()) {
+    private suspend fun fetchPipedJsonFast(path: String): String? = withContext(Dispatchers.IO) {
+        for (base in pipedCandidates().take(3)) {
             val body = runCatching {
-                val req = Request.Builder()
-                    .url("$base$path")
-                    .header("Accept", "application/json")
-                    .build()
-                httpClient.newCall(req).execute().use { resp ->
+                val req = Request.Builder().url("$base$path").header("Accept", "application/json").build()
+                fastClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val txt = resp.body?.string().orEmpty()
                         if (txt.isNotBlank() && (txt.startsWith("{") || txt.startsWith("["))) {
@@ -914,14 +1046,11 @@ class YouTubeMusicProvider(
         null
     }
 
-    private suspend fun fetchInvidiousJson(path: String): Pair<String, String>? = withContext(Dispatchers.IO) {
-        for (base in invidiousCandidates()) {
+    private suspend fun fetchInvidiousJsonFast(path: String): Pair<String, String>? = withContext(Dispatchers.IO) {
+        for (base in invidiousCandidates().take(3)) {
             val body = runCatching {
-                val req = Request.Builder()
-                    .url("$base$path")
-                    .header("Accept", "application/json")
-                    .build()
-                httpClient.newCall(req).execute().use { resp ->
+                val req = Request.Builder().url("$base$path").header("Accept", "application/json").build()
+                fastClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val txt = resp.body?.string().orEmpty()
                         if (txt.isNotBlank() && (txt.startsWith("{") || txt.startsWith("["))) txt else null

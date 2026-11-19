@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.rounded.Equalizer
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.Pause
@@ -52,9 +54,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -66,10 +68,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.domain.model.RepeatModeState
 import com.example.domain.model.VisualizerMode
@@ -78,6 +82,7 @@ import com.example.ui.components.SourceBadge
 import com.example.ui.components.TrackArtwork
 import com.example.ui.components.formatTimeMs
 import com.example.ui.viewmodel.MainViewModel
+import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -86,6 +91,7 @@ fun NowPlayingScreen(
     onClose: () -> Unit,
     onOpenLyrics: () -> Unit,
     onOpenEqualizer: () -> Unit,
+    onOpenListenTogether: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     BackHandler { onClose() }
@@ -93,7 +99,9 @@ fun NowPlayingScreen(
     val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val audioFrame by viewModel.audioAnalysis.collectAsStateWithLifecycle()
+    val listenState by viewModel.listenTogetherState.collectAsStateWithLifecycle()
     val track = playbackState.currentTrack
+    val activeRoom = listenState.activeRoom
 
     var showQueueSheet by remember { mutableStateOf(false) }
     var showSpeedSheet by remember { mutableStateOf(false) }
@@ -103,14 +111,28 @@ fun NowPlayingScreen(
     val effectivePos = if (isSeeking) seekSliderPos.toLong() else playbackState.positionMs
     val maxDur = playbackState.durationMs.coerceAtLeast(1L)
 
+    // Dynamic ambient top tint per track for rich Spotify/Apple Music-grade atmosphere
+    val ambientPalette = remember(track?.id) {
+        val swatches = listOf(
+            Color(0xFF1D4D4F) to Color(0xFF0E1D24),
+            Color(0xFF4A2545) to Color(0xFF1A0F1D),
+            Color(0xFF1E3A5F) to Color(0xFF0D1726),
+            Color(0xFF4F2E1E) to Color(0xFF1D120D),
+            Color(0xFF1F4B3B) to Color(0xFF0D1E19),
+            Color(0xFF392B58) to Color(0xFF151024)
+        )
+        val idx = abs((track?.id ?: "default").hashCode()) % swatches.size
+        swatches[idx]
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
                     colors = listOf(
-                        MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
-                        MaterialTheme.colorScheme.background,
+                        ambientPalette.first,
+                        ambientPalette.second,
                         MaterialTheme.colorScheme.background
                     )
                 )
@@ -133,23 +155,88 @@ fun NowPlayingScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = onClose, modifier = Modifier.testTag("np_close_button")) {
-                    Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "Collapse player", modifier = Modifier.size(30.dp))
-                }
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "NOW PLAYING",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    if (track != null) {
-                        Spacer(Modifier.height(2.dp))
-                        SourceBadge(track.source)
+                Surface(
+                    shape = CircleShape,
+                    color = Color.White.copy(alpha = 0.10f)
+                ) {
+                    IconButton(
+                        onClick = onClose,
+                        modifier = Modifier
+                            .size(44.dp)
+                            .testTag("np_close_button")
+                    ) {
+                        Icon(
+                            Icons.Rounded.KeyboardArrowDown,
+                            contentDescription = "Tutup pemutar",
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp)
+                        )
                     }
                 }
-                IconButton(onClick = { showSpeedSheet = true }) {
-                    Icon(Icons.Rounded.Speed, contentDescription = "Playback speed")
+
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (activeRoom != null) {
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                            border = BorderStroke(
+                                1.dp,
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable(onClick = onOpenListenTogether)
+                                .testTag("np_active_room_pill")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Headphones,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "SYNC • ${activeRoom.roomCode}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.8.sp
+                                )
+                            }
+                        }
+                    } else {
+                        Text(
+                            text = "SEDANG DIPUTAR",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White.copy(alpha = 0.72f),
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.2.sp
+                        )
+                        if (track != null) {
+                            Spacer(Modifier.height(3.dp))
+                            SourceBadge(track.source)
+                        }
+                    }
+                }
+
+                Surface(
+                    shape = CircleShape,
+                    color = Color.White.copy(alpha = 0.10f)
+                ) {
+                    IconButton(
+                        onClick = { showSpeedSheet = true },
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.Speed,
+                            contentDescription = "Kecepatan pemutaran",
+                            tint = Color.White
+                        )
+                    }
                 }
             }
 
@@ -169,9 +256,9 @@ fun NowPlayingScreen(
                 }
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(10.dp))
 
-            // Main Stage: Large Artwork + Optional Live Audio-Reactive Visualizer Overlay
+            // Main Stage: Framed Elevated Artwork + Optional Audio-Reactive Visualizer
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -179,45 +266,50 @@ fun NowPlayingScreen(
                     .padding(vertical = 4.dp),
                 contentAlignment = Alignment.Center
             ) {
-                Box(
+                Surface(
+                    shape = RoundedCornerShape(settings.artworkShapeStyle.cornerDp.dp),
+                    shadowElevation = 22.dp,
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.16f)),
+                    color = Color.Black.copy(alpha = 0.3f),
                     modifier = Modifier
                         .fillMaxWidth(0.88f)
                         .aspectRatio(1f)
-                        .clip(RoundedCornerShape(settings.artworkShapeStyle.cornerDp.dp))
                 ) {
-                    TrackArtwork(
-                        artworkUrl = track?.artworkUrl,
-                        contentDescription = track?.title ?: "Album artwork",
-                        modifier = Modifier.fillMaxSize(),
-                        cornerRadius = settings.artworkShapeStyle.cornerDp.dp,
-                        isRadio = track?.isLiveStream == true
-                    )
-                    if (settings.visualizerMode != VisualizerMode.OFF) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(
-                                    Brush.verticalGradient(
-                                        listOf(
-                                            Color.Black.copy(alpha = 0.25f),
-                                            Color.Black.copy(alpha = 0.65f)
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        TrackArtwork(
+                            artworkUrl = track?.artworkUrl,
+                            contentDescription = track?.title ?: "Sampul album",
+                            modifier = Modifier.fillMaxSize(),
+                            cornerRadius = settings.artworkShapeStyle.cornerDp.dp,
+                            isRadio = track?.isLiveStream == true
+                        )
+                        if (settings.visualizerMode != VisualizerMode.OFF) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        Brush.verticalGradient(
+                                            listOf(
+                                                Color.Black.copy(alpha = 0.22f),
+                                                Color.Black.copy(alpha = 0.66f)
+                                            )
                                         )
                                     )
+                                    .padding(14.dp)
+                            ) {
+                                AudioVisualizerCanvas(
+                                    frame = audioFrame,
+                                    mode = settings.visualizerMode,
+                                    primaryColor = MaterialTheme.colorScheme.primary,
+                                    secondaryColor = MaterialTheme.colorScheme.secondary
                                 )
-                                .padding(14.dp)
-                        ) {
-                            AudioVisualizerCanvas(
-                                frame = audioFrame,
-                                mode = settings.visualizerMode,
-                                primaryColor = MaterialTheme.colorScheme.primary,
-                                secondaryColor = MaterialTheme.colorScheme.secondary
-                            )
+                            }
                         }
                     }
                 }
             }
 
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(16.dp))
 
             // Title, Artist, Album & Favorite
             Row(
@@ -226,18 +318,20 @@ fun NowPlayingScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = track?.title ?: "Nothing Playing",
+                        text = track?.title ?: "Belum Ada Lagu",
                         style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(3.dp))
                     Text(
                         text = track?.let {
                             if (it.album.isNotBlank()) "${it.artist} • ${it.album}" else it.artist
-                        } ?: "Select a song to start playback",
+                        } ?: "Pilih lagu untuk mulai memutar",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = Color.White.copy(alpha = 0.72f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -249,8 +343,9 @@ fun NowPlayingScreen(
                     ) {
                         Icon(
                             imageVector = if (track.isFavorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                            contentDescription = "Favorite track",
-                            tint = if (track.isFavorite) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurface
+                            contentDescription = "Favoritkan lagu",
+                            tint = if (track.isFavorite) MaterialTheme.colorScheme.secondary else Color.White,
+                            modifier = Modifier.size(28.dp)
                         )
                     }
                 }
@@ -263,13 +358,15 @@ fun NowPlayingScreen(
                     color = MaterialTheme.colorScheme.error,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 4.dp)
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp)
                 )
             }
 
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
 
-            // Interactive Seekbar
+            // Interactive Seekbar (Spotify crisp white active track)
             Slider(
                 value = if (track?.isLiveStream == true) 1f else effectivePos.toFloat().coerceIn(0f, maxDur.toFloat()),
                 onValueChange = {
@@ -286,6 +383,11 @@ fun NowPlayingScreen(
                 },
                 valueRange = 0f..(if (track?.isLiveStream == true) 1f else maxDur.toFloat()),
                 enabled = track != null && !track.isLiveStream,
+                colors = SliderDefaults.colors(
+                    thumbColor = Color.White,
+                    activeTrackColor = Color.White,
+                    inactiveTrackColor = Color.White.copy(alpha = 0.25f)
+                ),
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("np_seekbar")
@@ -296,14 +398,14 @@ fun NowPlayingScreen(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    text = if (track?.isLiveStream == true) "LIVE BROADCAST" else formatTimeMs(effectivePos),
+                    text = if (track?.isLiveStream == true) "SIARAN LANGSUNG" else formatTimeMs(effectivePos),
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = Color.White.copy(alpha = 0.72f)
                 )
                 Text(
-                    text = if (track?.isLiveStream == true) "STREAM" else formatTimeMs(playbackState.durationMs),
+                    text = if (track?.isLiveStream == true) "LIVE" else formatTimeMs(playbackState.durationMs),
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = Color.White.copy(alpha = 0.72f)
                 )
             }
 
@@ -321,8 +423,8 @@ fun NowPlayingScreen(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Shuffle,
-                        contentDescription = "Shuffle",
-                        tint = if (playbackState.shuffleEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                        contentDescription = "Acak",
+                        tint = if (playbackState.shuffleEnabled) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.7f)
                     )
                 }
 
@@ -332,12 +434,18 @@ fun NowPlayingScreen(
                         .size(54.dp)
                         .testTag("np_prev_button")
                 ) {
-                    Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous", modifier = Modifier.size(36.dp))
+                    Icon(
+                        Icons.Rounded.SkipPrevious,
+                        contentDescription = "Sebelumnya",
+                        tint = Color.White,
+                        modifier = Modifier.size(38.dp)
+                    )
                 }
 
                 Surface(
                     shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primary,
+                    color = Color.White,
+                    shadowElevation = 10.dp,
                     modifier = Modifier
                         .size(72.dp)
                         .clip(CircleShape)
@@ -347,15 +455,15 @@ fun NowPlayingScreen(
                     Box(contentAlignment = Alignment.Center) {
                         if (playbackState.isBuffering) {
                             CircularProgressIndicator(
-                                color = MaterialTheme.colorScheme.onPrimary,
+                                color = Color(0xFF0A0E17),
                                 modifier = Modifier.size(28.dp),
                                 strokeWidth = 3.dp
                             )
                         } else {
                             Icon(
                                 imageVector = if (playbackState.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                contentDescription = if (playbackState.isPlaying) "Pause" else "Play",
-                                tint = MaterialTheme.colorScheme.onPrimary,
+                                contentDescription = if (playbackState.isPlaying) "Jeda" else "Putar",
+                                tint = Color(0xFF0A0E17),
                                 modifier = Modifier.size(38.dp)
                             )
                         }
@@ -368,7 +476,12 @@ fun NowPlayingScreen(
                         .size(54.dp)
                         .testTag("np_next_button")
                 ) {
-                    Icon(Icons.Rounded.SkipNext, contentDescription = "Next", modifier = Modifier.size(36.dp))
+                    Icon(
+                        Icons.Rounded.SkipNext,
+                        contentDescription = "Berikutnya",
+                        tint = Color.White,
+                        modifier = Modifier.size(38.dp)
+                    )
                 }
 
                 IconButton(
@@ -378,41 +491,62 @@ fun NowPlayingScreen(
                     Icon(
                         imageVector = if (playbackState.repeatMode == RepeatModeState.ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
                         contentDescription = playbackState.repeatMode.label,
-                        tint = if (playbackState.repeatMode != RepeatModeState.OFF) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                        tint = if (playbackState.repeatMode != RepeatModeState.OFF) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.7f)
                     )
                 }
             }
 
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(16.dp))
 
-            // Bottom Studio Action Bar: Lyrics | Equalizer | Queue
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
+            // Bottom Studio Glass Action Dock: Lirik | Bersama | EQ | Antrean
+            Surface(
+                shape = RoundedCornerShape(22.dp),
+                color = Color.White.copy(alpha = 0.08f),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.12f)),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                TextButton(
-                    onClick = onOpenLyrics,
-                    modifier = Modifier.testTag("np_lyrics_button")
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
-                    Icon(Icons.Rounded.Lyrics, contentDescription = null, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Lyrics")
-                }
-                TextButton(
-                    onClick = onOpenEqualizer,
-                    modifier = Modifier.testTag("np_equalizer_button")
-                ) {
-                    Icon(Icons.Rounded.Equalizer, contentDescription = null, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Equalizer")
-                }
-                TextButton(
-                    onClick = { showQueueSheet = true },
-                    modifier = Modifier.testTag("np_queue_button")
-                ) {
-                    Icon(Icons.AutoMirrored.Rounded.QueueMusic, contentDescription = null, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Queue (${playbackState.queue.size})")
+                    StudioDockAction(
+                        icon = Icons.Rounded.Lyrics,
+                        label = "Lirik",
+                        highlighted = false,
+                        onClick = onOpenLyrics,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("np_lyrics_button")
+                    )
+                    StudioDockAction(
+                        icon = Icons.Rounded.Headphones,
+                        label = if (activeRoom != null) activeRoom.roomCode else "Bersama",
+                        highlighted = activeRoom != null,
+                        onClick = onOpenListenTogether,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("np_listen_together_button")
+                    )
+                    StudioDockAction(
+                        icon = Icons.Rounded.Equalizer,
+                        label = "Equalizer",
+                        highlighted = false,
+                        onClick = onOpenEqualizer,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("np_equalizer_button")
+                    )
+                    StudioDockAction(
+                        icon = Icons.AutoMirrored.Rounded.QueueMusic,
+                        label = "Antrean (${playbackState.queue.size})",
+                        highlighted = false,
+                        onClick = { showQueueSheet = true },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("np_queue_button")
+                    )
                 }
             }
         }
@@ -431,19 +565,19 @@ fun NowPlayingScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Up Next Queue (${playbackState.queue.size})", style = MaterialTheme.typography.titleLarge)
+                    Text("Antrean Berikutnya (${playbackState.queue.size})", style = MaterialTheme.typography.titleLarge)
                     Row {
                         IconButton(onClick = {
                             viewModel.saveCurrentQueueAsPlaylist("Queue Mix")
                             showQueueSheet = false
                         }) {
-                            Icon(Icons.Rounded.Save, contentDescription = "Save queue as playlist")
+                            Icon(Icons.Rounded.Save, contentDescription = "Simpan antrean ke playlist")
                         }
                         IconButton(onClick = {
                             viewModel.container.playbackController.clearQueue()
                             showQueueSheet = false
                         }) {
-                            Icon(Icons.Rounded.DeleteSweep, contentDescription = "Clear queue")
+                            Icon(Icons.Rounded.DeleteSweep, contentDescription = "Bersihkan antrean")
                         }
                     }
                 }
@@ -485,16 +619,16 @@ fun NowPlayingScreen(
                                 onClick = { viewModel.container.playbackController.moveQueueItem(index, index - 1) },
                                 enabled = index > 0
                             ) {
-                                Icon(Icons.Rounded.ArrowUpward, contentDescription = "Move up")
+                                Icon(Icons.Rounded.ArrowUpward, contentDescription = "Naikkan")
                             }
                             IconButton(
                                 onClick = { viewModel.container.playbackController.moveQueueItem(index, index + 1) },
                                 enabled = index < playbackState.queue.lastIndex
                             ) {
-                                Icon(Icons.Rounded.ArrowDownward, contentDescription = "Move down")
+                                Icon(Icons.Rounded.ArrowDownward, contentDescription = "Turunkan")
                             }
                             IconButton(onClick = { viewModel.container.playbackController.removeFromQueue(index) }) {
-                                Icon(Icons.Rounded.Close, contentDescription = "Remove from queue")
+                                Icon(Icons.Rounded.Close, contentDescription = "Hapus dari antrean")
                             }
                         }
                     }
@@ -508,7 +642,7 @@ fun NowPlayingScreen(
         val speeds = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
         ModalBottomSheet(onDismissRequest = { showSpeedSheet = false }) {
             Column(modifier = Modifier.padding(20.dp)) {
-                Text("Playback Speed (${playbackState.playbackSpeed}x)", style = MaterialTheme.typography.titleLarge)
+                Text("Kecepatan Pemutaran (${playbackState.playbackSpeed}x)", style = MaterialTheme.typography.titleLarge)
                 Spacer(Modifier.height(14.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -528,5 +662,38 @@ fun NowPlayingScreen(
                 Spacer(Modifier.height(24.dp))
             }
         }
+    }
+}
+
+@Composable
+private fun StudioDockAction(
+    icon: ImageVector,
+    label: String,
+    highlighted: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp, horizontal = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = if (highlighted) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.9f),
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (highlighted) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.82f),
+            fontWeight = if (highlighted) FontWeight.Bold else FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }

@@ -45,9 +45,9 @@ data class AppSettings(
     val playbackSpeed: Float = 1.0f,
     // Lyrics & Translation
     val autoLyricsEnabled: Boolean = true,
-    val lyricsFontSizeSp: Float = 20f,
-    val lyricsLineSpacingSp: Float = 10f,
-    val lyricsAlignment: LyricsAlignment = LyricsAlignment.CENTER,
+    val lyricsFontSizeSp: Float = 26f,
+    val lyricsLineSpacingSp: Float = 16f,
+    val lyricsAlignment: LyricsAlignment = LyricsAlignment.START,
     val lyricsDisplayMode: LyricsDisplayMode = LyricsDisplayMode.ORIGINAL,
     val autoTranslateLyrics: Boolean = false,
     val targetTranslationLang: String = "id",
@@ -56,17 +56,11 @@ data class AppSettings(
     val librarySortOption: LibrarySortOption = LibrarySortOption.TITLE_ASC,
     val customScanFolders: Set<String> = emptySet(),
     val excludedFolders: Set<String> = emptySet(),
-    // Music Sources & Provider Configuration
-    val enabledSources: Set<MusicSource> = setOf(
-        MusicSource.LOCAL,
-        MusicSource.AUDIUS,
-        MusicSource.YOUTUBE_MUSIC,
-        MusicSource.JAMENDO,
-        MusicSource.RADIO
-    ),
+    // Music Sources & Provider Configuration (Default: YouTube Music ONLY)
+    val enabledSources: Set<MusicSource> = setOf(MusicSource.YOUTUBE_MUSIC),
     val sourcePriorityOrder: List<MusicSource> = listOf(
-        MusicSource.AUDIUS,
         MusicSource.YOUTUBE_MUSIC,
+        MusicSource.AUDIUS,
         MusicSource.LOCAL,
         MusicSource.JAMENDO,
         MusicSource.RADIO
@@ -83,9 +77,10 @@ data class AppSettings(
     val bassBoostStrength: Int = 0, // 0..1000
     val virtualizerStrength: Int = 0, // 0..1000
     val loudnessGainMb: Int = 0, // 0..1500
-    // Resume state
+    // Resume state & Listen Together
     val lastTrackId: String = "",
-    val lastPositionMs: Long = 0L
+    val lastPositionMs: Long = 0L,
+    val listenUsername: String = ""
 )
 
 class SettingsDataStore(private val context: Context) {
@@ -135,14 +130,16 @@ class SettingsDataStore(private val context: Context) {
 
         val LAST_TRACK_ID = stringPreferencesKey("last_track_id")
         val LAST_POSITION_MS = longPreferencesKey("last_position_ms")
+        val LISTEN_USERNAME = stringPreferencesKey("listen_username")
+        val ENABLED_SOURCES_V2 = stringSetPreferencesKey("enabled_sources_v2")
     }
 
     val settingsFlow: Flow<AppSettings> = context.koplingfyDataStore.data.map { prefs ->
-        val defaultSources = MusicSource.entries.map { it.name }.toSet()
-        val enabledNames = prefs[Keys.ENABLED_SOURCES] ?: defaultSources
+        val defaultSources = setOf(MusicSource.YOUTUBE_MUSIC.name)
+        val enabledNames = prefs[Keys.ENABLED_SOURCES_V2] ?: defaultSources
         val enabledSources = enabledNames.mapNotNull { name ->
             runCatching { MusicSource.valueOf(name) }.getOrNull()
-        }.toSet().ifEmpty { MusicSource.entries.toSet() }
+        }.toSet().ifEmpty { setOf(MusicSource.YOUTUBE_MUSIC) }
 
         val priorityStr = prefs[Keys.SOURCE_PRIORITY]
         val priorityOrder = if (priorityStr.isNullOrBlank()) {
@@ -183,10 +180,10 @@ class SettingsDataStore(private val context: Context) {
             defaultShuffle = prefs[Keys.DEFAULT_SHUFFLE] ?: false,
             playbackSpeed = prefs[Keys.PLAYBACK_SPEED] ?: 1.0f,
             autoLyricsEnabled = prefs[Keys.AUTO_LYRICS] ?: true,
-            lyricsFontSizeSp = prefs[Keys.LYRICS_FONT_SIZE] ?: 20f,
-            lyricsLineSpacingSp = prefs[Keys.LYRICS_LINE_SPACING] ?: 10f,
+            lyricsFontSizeSp = prefs[Keys.LYRICS_FONT_SIZE] ?: 26f,
+            lyricsLineSpacingSp = prefs[Keys.LYRICS_LINE_SPACING] ?: 16f,
             lyricsAlignment = prefs[Keys.LYRICS_ALIGNMENT]?.let { runCatching { LyricsAlignment.valueOf(it) }.getOrNull() }
-                ?: LyricsAlignment.CENTER,
+                ?: LyricsAlignment.START,
             lyricsDisplayMode = prefs[Keys.LYRICS_DISPLAY_MODE]?.let { runCatching { LyricsDisplayMode.valueOf(it) }.getOrNull() }
                 ?: LyricsDisplayMode.ORIGINAL,
             autoTranslateLyrics = prefs[Keys.AUTO_TRANSLATE] ?: false,
@@ -211,7 +208,8 @@ class SettingsDataStore(private val context: Context) {
             virtualizerStrength = prefs[Keys.VIRTUALIZER] ?: 0,
             loudnessGainMb = prefs[Keys.LOUDNESS] ?: 0,
             lastTrackId = prefs[Keys.LAST_TRACK_ID] ?: "",
-            lastPositionMs = prefs[Keys.LAST_POSITION_MS] ?: 0L
+            lastPositionMs = prefs[Keys.LAST_POSITION_MS] ?: 0L,
+            listenUsername = prefs[Keys.LISTEN_USERNAME] ?: ""
         )
     }
 
@@ -253,9 +251,9 @@ class SettingsDataStore(private val context: Context) {
     }
 
     suspend fun toggleSourceEnabled(source: MusicSource, enabled: Boolean) = edit { prefs ->
-        val cur = (prefs[Keys.ENABLED_SOURCES] ?: MusicSource.entries.map { it.name }.toSet()).toMutableSet()
+        val cur = (prefs[Keys.ENABLED_SOURCES_V2] ?: setOf(MusicSource.YOUTUBE_MUSIC.name)).toMutableSet()
         if (enabled) cur.add(source.name) else cur.remove(source.name)
-        prefs[Keys.ENABLED_SOURCES] = cur
+        prefs[Keys.ENABLED_SOURCES_V2] = cur
     }
     suspend fun updateSourcePriority(order: List<MusicSource>) = edit {
         it[Keys.SOURCE_PRIORITY] = order.joinToString(",") { s -> s.name }
@@ -285,6 +283,10 @@ class SettingsDataStore(private val context: Context) {
     suspend fun saveLastPlayback(trackId: String, positionMs: Long) = edit {
         it[Keys.LAST_TRACK_ID] = trackId
         it[Keys.LAST_POSITION_MS] = positionMs
+    }
+
+    suspend fun updateListenUsername(username: String) = edit {
+        it[Keys.LISTEN_USERNAME] = username.trim().take(30)
     }
 
     private suspend fun edit(block: (androidx.datastore.preferences.core.MutablePreferences) -> Unit) {

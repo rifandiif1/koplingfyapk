@@ -3,6 +3,7 @@ package com.example.di
 import android.content.Context
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
+import com.example.R
 import com.example.data.local.db.KoplingfyDatabase
 import com.example.data.local.media.LocalMusicScanner
 import com.example.data.local.prefs.AppSettings
@@ -12,12 +13,15 @@ import com.example.data.providers.JamendoProvider
 import com.example.data.providers.MultiSourceRepository
 import com.example.data.providers.RadioBrowserProvider
 import com.example.data.providers.YouTubeMusicProvider
+import com.example.data.remote.ListenTogetherController
+import com.example.data.remote.ListenTogetherRepository
 import com.example.download.DownloadManagerRepository
 import com.example.lyrics.LyricsEngine
 import com.example.lyrics.LyricsTranslationEngine
 import com.example.playback.EqualizerManager
 import com.example.playback.PlaybackController
 import com.example.playback.VisualizerAudioProcessor
+import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -139,6 +143,18 @@ class AppContainer(val context: Context) {
         context = context,
         downloadDao = database.downloadDao(),
         trackDao = database.trackDao()
+    )
+
+    // Lazily resolved using the provisioned named database ID (never parameterless FirebaseFirestore.getInstance())
+    val listenTogetherRepository: ListenTogetherRepository by lazy {
+        val dbId = context.applicationContext.getString(R.string.firestore_database_id)
+        ListenTogetherRepository(FirebaseFirestore.getInstance(dbId))
+    }
+
+    val listenTogetherController = ListenTogetherController(
+        repositoryProvider = { listenTogetherRepository },
+        playbackController = playbackController,
+        settingsDataStore = settingsDataStore
     )
 
     fun calculateCacheSizeBytes(): Long {

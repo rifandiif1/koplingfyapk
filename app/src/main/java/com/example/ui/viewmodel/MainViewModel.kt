@@ -32,6 +32,7 @@ import com.example.domain.model.ThemeMode
 import com.example.domain.model.Track
 import com.example.domain.model.TranslationProviderType
 import com.example.domain.model.VisualizerMode
+import com.example.data.remote.ListenTogetherUiState
 import com.example.lyrics.LyricsCandidate
 import com.example.lyrics.ParsedLyrics
 import com.example.playback.AudioAnalysisFrame
@@ -90,6 +91,7 @@ class MainViewModel(val container: AppContainer) : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSettings())
 
     val playbackState: StateFlow<PlaybackUiState> = container.playbackController.state
+    val listenTogetherState: StateFlow<ListenTogetherUiState> = container.listenTogetherController.state
     val audioAnalysis: StateFlow<AudioAnalysisFrame> = container.visualizerAudioProcessor.analysisFlow
     val equalizerState: StateFlow<EqualizerState> = container.equalizerManager.state
 
@@ -162,7 +164,7 @@ class MainViewModel(val container: AppContainer) : ViewModel() {
     private val _searchFieldFilter = MutableStateFlow(SearchFieldFilter.ANY)
     val searchFieldFilter: StateFlow<SearchFieldFilter> = _searchFieldFilter.asStateFlow()
 
-    private val _searchSelectedSources = MutableStateFlow(MusicSource.entries.toSet())
+    private val _searchSelectedSources = MutableStateFlow(setOf(MusicSource.YOUTUBE_MUSIC))
     val searchSelectedSources: StateFlow<Set<MusicSource>> = _searchSelectedSources.asStateFlow()
 
     private val _searchResult = MutableStateFlow(GlobalSearchResult())
@@ -229,17 +231,20 @@ class MainViewModel(val container: AppContainer) : ViewModel() {
     fun refreshHomeDiscovery() {
         viewModelScope.launch {
             _homeState.value = _homeState.value.copy(isLoading = true, errorMessage = null)
-            val s = settings.value
+            val s = settings.first()
+            _searchSelectedSources.value = s.enabledSources
             val trending = runCatching { container.multiSourceRepository.fetchHomeTrending(s) }.getOrDefault(emptyList())
             val newReleases = runCatching { container.multiSourceRepository.fetchHomeNewReleases(s) }.getOrDefault(emptyList())
-            val radio = runCatching { container.multiSourceRepository.fetchTopRadio(12) }.getOrDefault(emptyList())
+            val radio = if (MusicSource.RADIO in s.enabledSources) {
+                runCatching { container.multiSourceRepository.fetchTopRadio(12) }.getOrDefault(emptyList())
+            } else emptyList()
             _homeState.value = HomeUiState(
                 trendingTracks = trending,
                 newReleases = newReleases,
                 featuredRadio = radio,
                 isLoading = false,
                 errorMessage = if (trending.isEmpty() && radio.isEmpty()) {
-                    "Offline or providers unreachable — local library & downloads remain ready."
+                    "Tidak dapat terhubung ke YouTube Music — periksa koneksi internet Anda."
                 } else null
             )
         }
@@ -788,7 +793,10 @@ class MainViewModel(val container: AppContainer) : ViewModel() {
     }
     fun toggleSourceEnabled(source: MusicSource, enabled: Boolean) = viewModelScope.launch {
         container.settingsDataStore.toggleSourceEnabled(source, enabled)
+        val updated = settings.first().enabledSources
+        _searchSelectedSources.value = updated
         checkProvidersHealth()
+        refreshHomeDiscovery()
     }
     fun moveSourcePriority(source: MusicSource, delta: Int) = viewModelScope.launch {
         val list = settings.value.sourcePriorityOrder.toMutableList()

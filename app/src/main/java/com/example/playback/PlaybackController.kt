@@ -66,7 +66,14 @@ class PlaybackController(
     private var pendingTrackToPlay: Pair<Track, List<Track>>? = null
     private var resolveJob: Job? = null
     private var currentStreamAttempt = 0
-    private val maxStreamAttempts = 6
+    private val maxStreamAttempts = 4
+    private var suppressLocalBroadcast = false
+
+    /**
+     * Callback invoked ONLY on local user-initiated play/pause/seek/track changes so
+     * an active Listen Together room can broadcast the change to other listeners.
+     */
+    var onLocalPlaybackAction: ((track: Track?, isPlaying: Boolean, positionMs: Long) -> Unit)? = null
 
     init {
         connectToService()
@@ -144,7 +151,7 @@ class PlaybackController(
                     currentStreamAttempt = nextAttempt + 1
                     _state.value = _state.value.copy(
                         isBuffering = true,
-                        errorMessage = "Switching stream mirror (tier ${nextAttempt + 1})..."
+                        errorMessage = "Menghubungkan jalur stream alternatif..."
                     )
                     resolveJob?.cancel()
                     resolveJob = scope.launch {
@@ -157,7 +164,7 @@ class PlaybackController(
                             _state.value = _state.value.copy(
                                 isBuffering = false,
                                 isPlaying = false,
-                                errorMessage = "Stream error: ${error.localizedMessage ?: "All mirrors exhausted"}"
+                                errorMessage = "Gagal memuat stream: ${error.localizedMessage ?: "Coba lagi atau pilih lagu lain"}"
                             )
                         }
                     }
@@ -165,7 +172,7 @@ class PlaybackController(
                     _state.value = _state.value.copy(
                         isBuffering = false,
                         isPlaying = false,
-                        errorMessage = "Playback error: ${error.localizedMessage ?: "Unable to stream track"}"
+                        errorMessage = "Gagal memutar audio: ${error.localizedMessage ?: "Periksa koneksi internet"}"
                     )
                 }
             }
@@ -193,7 +200,7 @@ class PlaybackController(
         }
     }
 
-    fun playTrack(track: Track, queue: List<Track> = listOf(track)) {
+    fun playTrack(track: Track, queue: List<Track> = listOf(track), fromRemoteSync: Boolean = false, startPositionMs: Long = 0L, autoPlay: Boolean = true) {
         val controller = mediaController
         if (controller == null) {
             pendingTrackToPlay = track to queue
@@ -209,10 +216,14 @@ class PlaybackController(
             queue = normalizedQueue,
             currentIndex = idx,
             isBuffering = true,
-            positionMs = 0L,
+            positionMs = startPositionMs,
             durationMs = track.durationMs,
             errorMessage = null
         )
+
+        if (!fromRemoteSync && !suppressLocalBroadcast) {
+            onLocalPlaybackAction?.invoke(track, autoPlay, startPositionMs)
+        }
 
         resolveJob?.cancel()
         resolveJob = scope.launch {
@@ -224,7 +235,7 @@ class PlaybackController(
             )
             trackDao.upsertTrack(TrackEntity.fromDomain(merged))
             historyDao.insertHistory(PlaybackHistoryEntity(trackId = merged.id, playedAt = System.currentTimeMillis()))
-            settingsDataStore.saveLastPlayback(merged.id, 0L)
+            settingsDataStore.saveLastPlayback(merged.id, startPositionMs)
             _state.value = _state.value.copy(currentTrack = merged)
 
             val settings = settingsDataStore.settingsFlow.first()
@@ -233,12 +244,45 @@ class PlaybackController(
                 _state.value = _state.value.copy(
                     isBuffering = false,
                     isPlaying = false,
-                    errorMessage = "Unable to resolve stream for ${merged.title}"
+                    errorMessage = "Tidak dapat memuat audio untuk ${merged.title}"
                 )
                 return@launch
             }
             currentStreamAttempt = stream.tierIndex + 1
-            prepareAndStartSingle(controller, merged, stream, autoPlay = true)
+            prepareAndStartSingle(controller, merged, stream, autoPlay = autoPlay, startPositionMs = startPositionMs)
+        }
+    }
+
+    /**
+     * Applies remote Listen Together room state without broadcasting back to Firestore.
+     */
+    fun applyRemoteSync(track: Track, shouldPlay: Boolean, targetPositionMs: Long) {
+        suppressLocalBroadcast = true
+        try {
+            val controller = mediaController
+            val current = _state.value.currentTrack
+            if (current == null || current.id != track.id || controller == null || controller.mediaItemCount == 0) {
+                playTrack(
+                    track = track,
+                    queue = listOf(track),
+                    fromRemoteSync = true,
+                    startPositionMs = targetPositionMs,
+                    autoPlay = shouldPlay
+                )
+            } else {
+                val drift = kotlin.math.abs(controller.currentPosition - targetPositionMs)
+                if (drift > 2_500L) {
+                    controller.seekTo(targetPositionMs.coerceAtLeast(0L))
+                    _state.value = _state.value.copy(positionMs = targetPositionMs.coerceAtLeast(0L))
+                }
+                if (shouldPlay && !controller.isPlaying) {
+                    controller.play()
+                } else if (!shouldPlay && controller.isPlaying) {
+                    controller.pause()
+                }
+            }
+        } finally {
+            suppressLocalBroadcast = false
         }
     }
 
@@ -246,7 +290,8 @@ class PlaybackController(
         controller: MediaController,
         track: Track,
         stream: ResolvedStream,
-        autoPlay: Boolean
+        autoPlay: Boolean,
+        startPositionMs: Long = 0L
     ) {
         activeStreamUserAgent.set(
             stream.userAgent?.takeIf { it.isNotBlank() } ?: "Koplingfy/1.0.0 (Android; Media3)"
@@ -276,7 +321,10 @@ class PlaybackController(
 
         controller.setMediaItem(itemBuilder.build())
         controller.prepare()
-        if (autoPlay) controller.play()
+        if (startPositionMs > 1_000L) {
+            controller.seekTo(startPositionMs)
+        }
+        if (autoPlay) controller.play() else controller.pause()
     }
 
     fun togglePlayPause() {
@@ -285,13 +333,20 @@ class PlaybackController(
             _state.value.currentTrack?.let { playTrack(it, _state.value.queue) }
             return
         }
-        if (controller.isPlaying) controller.pause() else controller.play()
+        val willPlay = !controller.isPlaying
+        if (willPlay) controller.play() else controller.pause()
+        if (!suppressLocalBroadcast) {
+            onLocalPlaybackAction?.invoke(_state.value.currentTrack, willPlay, controller.currentPosition.coerceAtLeast(0L))
+        }
     }
 
     fun seekTo(positionMs: Long) {
         val safe = positionMs.coerceAtLeast(0L)
         mediaController?.seekTo(safe)
         _state.value = _state.value.copy(positionMs = safe)
+        if (!suppressLocalBroadcast) {
+            onLocalPlaybackAction?.invoke(_state.value.currentTrack, _state.value.isPlaying, safe)
+        }
     }
 
     fun skipToNext() {

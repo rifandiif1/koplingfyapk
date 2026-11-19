@@ -1,0 +1,154 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRoomCode(code) {
+      return isValidId(code) && code.size() >= 4 && code.size() <= 12 && code.matches('^[A-Z0-9]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidListenRoom(data, roomCode) {
+      return data.keys().hasAll([
+          'roomCode', 'hostUid', 'hostUsername', 'roomName', 'active',
+          'memberUids', 'memberNames', 'trackId', 'trackTitle', 'trackArtist',
+          'trackAlbum', 'trackArtworkUrl', 'trackDurationMs', 'trackSource',
+          'trackSourceId', 'trackStreamUrl', 'playing', 'positionMs',
+          'playbackUpdatedAtMs', 'updatedByUid', 'updatedByUsername',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'roomCode', 'hostUid', 'hostUsername', 'roomName', 'active',
+          'memberUids', 'memberNames', 'trackId', 'trackTitle', 'trackArtist',
+          'trackAlbum', 'trackArtworkUrl', 'trackDurationMs', 'trackSource',
+          'trackSourceId', 'trackStreamUrl', 'playing', 'positionMs',
+          'playbackUpdatedAtMs', 'updatedByUid', 'updatedByUsername',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.roomCode is string && data.roomCode == roomCode &&
+        data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128 &&
+        data.hostUsername is string && data.hostUsername.size() >= 2 && data.hostUsername.size() <= 30 &&
+        data.roomName is string && data.roomName.size() >= 1 && data.roomName.size() <= 60 &&
+        data.active is bool &&
+        data.memberUids is list && data.memberUids.size() <= 20 &&
+          (data.memberUids.size() == 0 || data.memberUids[0] is string) &&
+        data.memberNames is map && data.memberNames.size() <= 20 &&
+        data.trackId is string && data.trackId.size() <= 128 &&
+        data.trackTitle is string && data.trackTitle.size() <= 200 &&
+        data.trackArtist is string && data.trackArtist.size() <= 150 &&
+        data.trackAlbum is string && data.trackAlbum.size() <= 150 &&
+        data.trackArtworkUrl is string && data.trackArtworkUrl.size() <= 500 &&
+        data.trackDurationMs is int && data.trackDurationMs >= 0 && data.trackDurationMs <= 86400000 &&
+        data.trackSource in ['', 'YOUTUBE_MUSIC', 'AUDIUS', 'JAMENDO', 'RADIO', 'LOCAL'] &&
+        data.trackSourceId is string && data.trackSourceId.size() <= 128 &&
+        data.trackStreamUrl is string && data.trackStreamUrl.size() <= 500 &&
+        data.playing is bool &&
+        data.positionMs is int && data.positionMs >= 0 && data.positionMs <= 86400000 &&
+        data.playbackUpdatedAtMs is int && data.playbackUpdatedAtMs >= 0 &&
+        data.updatedByUid is string && data.updatedByUid.size() >= 1 && data.updatedByUid.size() <= 128 &&
+        data.updatedByUsername is string && data.updatedByUsername.size() >= 2 && data.updatedByUsername.size() <= 30 &&
+        data.createdAt is timestamp && data.createdAt <= request.time &&
+        data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /listen_rooms/{roomCode} {
+      // Exact room lookup by code requires knowing the exact 4-12 char roomCode
+      allow get: if isSignedIn() && isValidRoomCode(roomCode);
+
+      // Listing rooms is strictly restricted to rooms where the caller is already a member
+      allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
+
+      // Host creates a new active room with themselves as the sole initial member
+      allow create: if isSignedIn() &&
+        isValidRoomCode(roomCode) &&
+        isValidListenRoom(incoming(), roomCode) &&
+        incoming().hostUid == request.auth.uid &&
+        incoming().updatedByUid == request.auth.uid &&
+        incoming().active == true &&
+        incoming().memberUids.size() == 1 &&
+        request.auth.uid in incoming().memberUids &&
+        incoming().memberNames.size() == 1 &&
+        incoming().memberNames[request.auth.uid] is string &&
+        incoming().memberNames[request.auth.uid].size() >= 2 &&
+        incoming().memberNames[request.auth.uid].size() <= 30;
+
+      // Action-based updates on active rooms only (active == false is terminal locked)
+      allow update: if isSignedIn() &&
+        isValidRoomCode(roomCode) &&
+        isValidListenRoom(incoming(), roomCode) &&
+        existing().active == true &&
+        incoming().hostUid == existing().hostUid &&
+        incoming().hostUsername == existing().hostUsername &&
+        incoming().roomCode == existing().roomCode &&
+        incoming().createdAt == existing().createdAt &&
+        (
+          // Action 1: Join room by code
+          (
+            !(request.auth.uid in existing().memberUids) &&
+            request.auth.uid in incoming().memberUids &&
+            incoming().memberUids.size() == existing().memberUids.size() + 1 &&
+            incoming().memberNames[request.auth.uid] is string &&
+            incoming().memberNames[request.auth.uid].size() >= 2 &&
+            incoming().memberNames[request.auth.uid].size() <= 30 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'memberNames', 'updatedAt'])
+          ) ||
+          // Action 2: Update own username while already a member
+          (
+            request.auth.uid in existing().memberUids &&
+            incoming().memberNames[request.auth.uid] is string &&
+            incoming().memberNames[request.auth.uid].size() >= 2 &&
+            incoming().memberNames[request.auth.uid].size() <= 30 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberNames', 'updatedAt'])
+          ) ||
+          // Action 3: Leave room
+          (
+            request.auth.uid in existing().memberUids &&
+            !(request.auth.uid in incoming().memberUids) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'memberNames', 'updatedAt'])
+          ) ||
+          // Action 4: Sync playback state (track, play/pause, seek) by any active room member
+          (
+            request.auth.uid in existing().memberUids &&
+            incoming().updatedByUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'trackId', 'trackTitle', 'trackArtist', 'trackAlbum', 'trackArtworkUrl',
+              'trackDurationMs', 'trackSource', 'trackSourceId', 'trackStreamUrl',
+              'playing', 'positionMs', 'playbackUpdatedAtMs',
+              'updatedByUid', 'updatedByUsername', 'updatedAt'
+            ])
+          ) ||
+          // Action 5: Close room (Host only, terminal state)
+          (
+            existing().hostUid == request.auth.uid &&
+            incoming().active == false &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['active', 'updatedAt'])
+          )
+        );
+
+      // Only the host may delete their room
+      allow delete: if isSignedIn() &&
+        isValidRoomCode(roomCode) &&
+        existing().hostUid == request.auth.uid;
+    }
+  }
+}

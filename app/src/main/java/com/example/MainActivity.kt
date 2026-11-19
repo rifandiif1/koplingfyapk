@@ -27,18 +27,19 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
-import androidx.compose.material.icons.outlined.Explore
+import androidx.compose.material.icons.outlined.Headphones
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.LibraryMusic
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material.icons.rounded.Explore
+import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -78,6 +79,7 @@ import com.example.ui.screens.EqualizerScreen
 import com.example.ui.screens.ExploreScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.LibraryScreen
+import com.example.ui.screens.ListenTogetherScreen
 import com.example.ui.screens.LyricsScreen
 import com.example.ui.screens.NowPlayingScreen
 import com.example.ui.screens.PlaylistsScreen
@@ -89,6 +91,7 @@ import com.example.ui.viewmodel.MainViewModel
 object Routes {
     const val HOME = "home"
     const val SEARCH = "search"
+    const val LISTEN_TOGETHER = "listen_together"
     const val EXPLORE = "explore"
     const val LIBRARY = "library"
     const val PLAYLISTS = "playlists"
@@ -166,8 +169,11 @@ private fun KoplingfyRootApp(
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
     val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
+    val listenTogetherState by viewModel.listenTogetherState.collectAsStateWithLifecycle()
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val customPlaylists by viewModel.customPlaylists.collectAsStateWithLifecycle()
+
+    val activeRoomCode = listenTogetherState.activeRoom?.roomCode
 
     var pendingTracksForPlaylist by remember { mutableStateOf<List<Track>?>(null) }
 
@@ -210,11 +216,10 @@ private fun KoplingfyRootApp(
     val tabs = remember {
         listOf(
             NavTab(Routes.HOME, "Home", Icons.Rounded.Home, Icons.Outlined.Home),
-            NavTab(Routes.SEARCH, "Search", Icons.Rounded.Search, Icons.Outlined.Search),
-            NavTab(Routes.EXPLORE, "Explore", Icons.Rounded.Explore, Icons.Outlined.Explore),
-            NavTab(Routes.LIBRARY, "Library", Icons.Rounded.LibraryMusic, Icons.Outlined.LibraryMusic),
-            NavTab(Routes.PLAYLISTS, "Playlists", Icons.AutoMirrored.Rounded.PlaylistPlay, Icons.AutoMirrored.Rounded.PlaylistPlay),
-            NavTab(Routes.SETTINGS, "Settings", Icons.Rounded.Settings, Icons.Outlined.Settings)
+            NavTab(Routes.SEARCH, "Cari", Icons.Rounded.Search, Icons.Outlined.Search),
+            NavTab(Routes.LISTEN_TOGETHER, "Bersama", Icons.Rounded.Headphones, Icons.Outlined.Headphones),
+            NavTab(Routes.LIBRARY, "Pustaka", Icons.Rounded.LibraryMusic, Icons.Outlined.LibraryMusic),
+            NavTab(Routes.SETTINGS, "Setelan", Icons.Rounded.Settings, Icons.Outlined.Settings)
         )
     }
 
@@ -242,6 +247,7 @@ private fun KoplingfyRootApp(
                         if (playbackState.currentTrack != null) {
                             MiniPlayerBar(
                                 playbackState = playbackState,
+                                activeRoomCode = activeRoomCode,
                                 onOpenNowPlaying = { navController.navigate(Routes.NOW_PLAYING) },
                                 onTogglePlayPause = { viewModel.container.playbackController.togglePlayPause() },
                                 onSkipNext = { viewModel.container.playbackController.skipToNext() }
@@ -257,13 +263,26 @@ private fun KoplingfyRootApp(
                                     selected = selected,
                                     onClick = { navigateToTab(tab.route) },
                                     icon = {
-                                        Icon(
-                                            imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
-                                            contentDescription = tab.label
-                                        )
+                                        if (tab.route == Routes.LISTEN_TOGETHER && activeRoomCode != null) {
+                                            BadgedBox(
+                                                badge = {
+                                                    Badge(containerColor = MaterialTheme.colorScheme.primary)
+                                                }
+                                            ) {
+                                                Icon(
+                                                    imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                                    contentDescription = tab.label
+                                                )
+                                            }
+                                        } else {
+                                            Icon(
+                                                imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                                contentDescription = tab.label
+                                            )
+                                        }
                                     },
                                     label = { Text(tab.label, maxLines = 1) },
-                                    alwaysShowLabel = false,
+                                    alwaysShowLabel = true,
                                     modifier = Modifier.testTag("nav_${tab.route}")
                                 )
                             }
@@ -286,10 +305,23 @@ private fun KoplingfyRootApp(
                                 selected = selected,
                                 onClick = { navigateToTab(tab.route) },
                                 icon = {
-                                    Icon(
-                                        imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
-                                        contentDescription = tab.label
-                                    )
+                                    if (tab.route == Routes.LISTEN_TOGETHER && activeRoomCode != null) {
+                                        BadgedBox(
+                                            badge = {
+                                                Badge(containerColor = MaterialTheme.colorScheme.primary)
+                                            }
+                                        ) {
+                                            Icon(
+                                                imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                                contentDescription = tab.label
+                                            )
+                                        }
+                                    } else {
+                                        Icon(
+                                            imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                            contentDescription = tab.label
+                                        )
+                                    }
                                 },
                                 label = { Text(tab.label) }
                             )
@@ -308,19 +340,29 @@ private fun KoplingfyRootApp(
                                 viewModel = viewModel,
                                 onOpenSources = {
                                     viewModel.selectExploreTab(4)
-                                    navigateToTab(Routes.EXPLORE)
+                                    navController.navigate(Routes.EXPLORE) { launchSingleTop = true }
                                 },
                                 onOpenGenreSearch = { genre ->
                                     viewModel.submitSearch(genre)
                                     navigateToTab(Routes.SEARCH)
                                 },
-                                onRequestAddToPlaylist = { track -> pendingTracksForPlaylist = listOf(track) }
+                                onRequestAddToPlaylist = { track -> pendingTracksForPlaylist = listOf(track) },
+                                onOpenListenTogether = { navigateToTab(Routes.LISTEN_TOGETHER) },
+                                onOpenPlaylists = { navController.navigate(Routes.PLAYLISTS) { launchSingleTop = true } },
+                                onOpenExplore = { navController.navigate(Routes.EXPLORE) { launchSingleTop = true } }
                             )
                         }
                         composable(Routes.SEARCH) {
                             SearchScreen(
                                 viewModel = viewModel,
                                 onRequestAddToPlaylist = { track -> pendingTracksForPlaylist = listOf(track) }
+                            )
+                        }
+                        composable(Routes.LISTEN_TOGETHER) {
+                            ListenTogetherScreen(
+                                viewModel = viewModel,
+                                onOpenSearch = { navigateToTab(Routes.SEARCH) },
+                                onOpenNowPlaying = { navController.navigate(Routes.NOW_PLAYING) }
                             )
                         }
                         composable(Routes.EXPLORE) {
@@ -344,7 +386,7 @@ private fun KoplingfyRootApp(
                                 onOpenEqualizer = { navController.navigate(Routes.EQUALIZER) },
                                 onOpenSources = {
                                     viewModel.selectExploreTab(4)
-                                    navigateToTab(Routes.EXPLORE)
+                                    navController.navigate(Routes.EXPLORE) { launchSingleTop = true }
                                 }
                             )
                         }
@@ -353,7 +395,11 @@ private fun KoplingfyRootApp(
                                 viewModel = viewModel,
                                 onClose = { navController.popBackStack() },
                                 onOpenLyrics = { navController.navigate(Routes.LYRICS) },
-                                onOpenEqualizer = { navController.navigate(Routes.EQUALIZER) }
+                                onOpenEqualizer = { navController.navigate(Routes.EQUALIZER) },
+                                onOpenListenTogether = {
+                                    navController.popBackStack()
+                                    navigateToTab(Routes.LISTEN_TOGETHER)
+                                }
                             )
                         }
                         composable(Routes.LYRICS) {
@@ -374,6 +420,7 @@ private fun KoplingfyRootApp(
                     if (!isFullScreenOverlay && useNavRail && playbackState.currentTrack != null) {
                         MiniPlayerBar(
                             playbackState = playbackState,
+                            activeRoomCode = activeRoomCode,
                             onOpenNowPlaying = { navController.navigate(Routes.NOW_PLAYING) },
                             onTogglePlayPause = { viewModel.container.playbackController.togglePlayPause() },
                             onSkipNext = { viewModel.container.playbackController.skipToNext() },
@@ -391,10 +438,10 @@ private fun KoplingfyRootApp(
     pendingTracksForPlaylist?.let { tracksToAdd ->
         AlertDialog(
             onDismissRequest = { pendingTracksForPlaylist = null },
-            title = { Text("Add ${tracksToAdd.size} Track(s) to Playlist") },
+            title = { Text("Tambahkan ${tracksToAdd.size} Lagu ke Playlist") },
             text = {
                 if (customPlaylists.isEmpty()) {
-                    Text("No custom playlists yet. Create one quickly below.")
+                    Text("Belum ada playlist. Buat playlist baru dengan cepat di bawah.")
                 } else {
                     LazyColumn(modifier = Modifier.height(220.dp)) {
                         items(customPlaylists, key = { it.id }) { pl ->
@@ -417,10 +464,10 @@ private fun KoplingfyRootApp(
                 Button(onClick = {
                     viewModel.createPlaylist("Mix #${customPlaylists.size + 1}", initialTracks = tracksToAdd)
                     pendingTracksForPlaylist = null
-                }) { Text("New Playlist") }
+                }) { Text("Playlist Baru") }
             },
             dismissButton = {
-                TextButton(onClick = { pendingTracksForPlaylist = null }) { Text("Cancel") }
+                TextButton(onClick = { pendingTracksForPlaylist = null }) { Text("Batal") }
             }
         )
     }

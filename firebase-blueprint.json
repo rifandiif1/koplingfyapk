@@ -1,0 +1,139 @@
+{
+  "entities": {
+    "ListenRoom": {
+      "title": "ListenRoom",
+      "description": "A real-time Listen Together music synchronization room identified by a shareable room code.",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "description": "Shareable 4-12 character uppercase room sync code matching the document ID."
+        },
+        "hostUid": {
+          "type": "string",
+          "description": "Immutable Firebase Auth UID of the user who created the room."
+        },
+        "hostUsername": {
+          "type": "string",
+          "description": "Display username of the room host (2-30 chars)."
+        },
+        "roomName": {
+          "type": "string",
+          "description": "Title of the Listen Together session (1-60 chars)."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Whether the room is currently active; transitions to false as a terminal closed state."
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "Bounded list (max 20) of authenticated user UIDs currently connected to the room."
+        },
+        "memberNames": {
+          "type": "object",
+          "description": "Map of authenticated user UID to chosen display username (max 20 entries)."
+        },
+        "trackId": {
+          "type": "string",
+          "description": "Unique track identifier currently loaded in the room."
+        },
+        "trackTitle": {
+          "type": "string",
+          "description": "Title of the currently synced song."
+        },
+        "trackArtist": {
+          "type": "string",
+          "description": "Artist name of the currently synced song."
+        },
+        "trackAlbum": {
+          "type": "string",
+          "description": "Album name of the currently synced song."
+        },
+        "trackArtworkUrl": {
+          "type": "string",
+          "description": "Artwork image URL for the synced song."
+        },
+        "trackDurationMs": {
+          "type": "integer",
+          "description": "Duration of the synced song in milliseconds."
+        },
+        "trackSource": {
+          "type": "string",
+          "description": "Music source provider enum name.",
+          "enum": ["", "YOUTUBE_MUSIC", "AUDIUS", "JAMENDO", "RADIO", "LOCAL"]
+        },
+        "trackSourceId": {
+          "type": "string",
+          "description": "Provider-specific track identifier (e.g., YouTube videoId)."
+        },
+        "trackStreamUrl": {
+          "type": "string",
+          "description": "Optional direct stream URL for radio or direct providers."
+        },
+        "playing": {
+          "type": "boolean",
+          "description": "Whether playback is currently playing or paused."
+        },
+        "positionMs": {
+          "type": "integer",
+          "description": "Playback position in milliseconds at playbackUpdatedAtMs."
+        },
+        "playbackUpdatedAtMs": {
+          "type": "integer",
+          "description": "Epoch milliseconds when playback state or seek position last changed."
+        },
+        "updatedByUid": {
+          "type": "string",
+          "description": "UID of the member who last updated room playback."
+        },
+        "updatedByUsername": {
+          "type": "string",
+          "description": "Username of the member who last updated room playback."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable room creation timestamp written via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last room update timestamp written via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "roomCode",
+        "hostUid",
+        "hostUsername",
+        "roomName",
+        "active",
+        "memberUids",
+        "memberNames",
+        "trackId",
+        "trackTitle",
+        "trackArtist",
+        "trackAlbum",
+        "trackArtworkUrl",
+        "trackDurationMs",
+        "trackSource",
+        "trackSourceId",
+        "trackStreamUrl",
+        "playing",
+        "positionMs",
+        "playbackUpdatedAtMs",
+        "updatedByUid",
+        "updatedByUsername",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/listen_rooms/{roomCode}": {
+      "schema": {
+        "$ref": "#/entities/ListenRoom"
+      },
+      "description": "Real-time Listen Together rooms synced across devices using a unique room code."
+    }
+  }
+}
