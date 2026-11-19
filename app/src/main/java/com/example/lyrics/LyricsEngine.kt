@@ -2,19 +2,24 @@ package com.example.lyrics
 
 import android.content.Context
 import android.net.Uri
+import android.util.Base64
 import com.example.data.local.db.LyricsDao
 import com.example.data.local.db.LyricsEntity
 import com.example.data.providers.TrackMetadataNormalizer
+import com.example.domain.model.MusicSource
 import com.example.domain.model.Track
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.Locale
 import kotlin.math.abs
 
 data class LyricsCandidate(
@@ -98,13 +103,25 @@ class LyricsEngine(
             return@withContext persistAndParse(track, bestCandidate)
         }
 
-        // 4. Fallback: Lyrics.ovh (BetterLyrics fallback for unsynced lyrics)
+        // 4. YouTube InnerTube /youtubei/v1/get_transcript synced lyrics (Metrolist transcript pipeline)
+        if (track.source == MusicSource.YOUTUBE_MUSIC) {
+            val videoId = track.sourceTrackId.takeIf { it.length == 11 }
+                ?: track.id.removePrefix("ytm_").takeIf { it.length == 11 }
+            if (videoId != null) {
+                val ytTranscript = fetchYouTubeTranscriptLyrics(videoId, track)
+                if (ytTranscript != null) {
+                    return@withContext persistAndParse(track, ytTranscript)
+                }
+            }
+        }
+
+        // 5. Fallback: Lyrics.ovh (BetterLyrics fallback for unsynced lyrics)
         val ovh = fetchLyricsOvh(cleanArtist, cleanTitle)
         if (ovh != null) {
             return@withContext persistAndParse(track, ovh)
         }
 
-        // 5. Optional Licensed Musixmatch API if key is configured
+        // 6. Optional Licensed Musixmatch API if key is configured
         val mmKey = musixmatchKeyProvider().trim()
         if (mmKey.isNotBlank()) {
             val mm = fetchMusixmatch(cleanTitle, cleanArtist, mmKey)
@@ -360,7 +377,121 @@ class LyricsEngine(
         }.getOrNull()
     }
 
+    private fun fetchYouTubeTranscriptLyrics(videoId: String, track: Track): LyricsCandidate? {
+        return runCatching {
+            val params = encodeTranscriptParams(videoId)
+            val payload = JSONObject().apply {
+                put("params", params)
+                put("context", JSONObject().apply {
+                    put("client", JSONObject().apply {
+                        put("clientName", "WEB")
+                        put("clientVersion", "2.20250312.04.00")
+                        put("hl", "en")
+                        put("gl", Locale.getDefault().country.takeIf { it.length == 2 } ?: "ID")
+                    })
+                })
+            }
+            val jsonType = "application/json; charset=utf-8".toMediaType()
+            val req = Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
+                .header("Origin", "https://www.youtube.com")
+                .header("Referer", "https://www.youtube.com/watch?v=$videoId")
+                .header("X-YouTube-Client-Name", "1")
+                .header("X-YouTube-Client-Version", "2.20250312.04.00")
+                .post(payload.toString().toRequestBody(jsonType))
+                .build()
+
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                if (!body.startsWith("{")) return@use null
+                val syncedLrc = parseYouTubeTranscriptToLrc(JSONObject(body)) ?: return@use null
+                LyricsCandidate(
+                    id = "yt_transcript_$videoId",
+                    trackName = track.title,
+                    artistName = track.artist,
+                    albumName = track.album,
+                    durationSec = track.durationMs / 1000L,
+                    syncedLyrics = syncedLrc,
+                    plainLyrics = null,
+                    providerName = "YouTube Transcript",
+                    matchScore = 88
+                )
+            }
+        }.getOrNull()
+    }
+
     companion object {
+        internal fun encodeTranscriptParams(videoId: String): String {
+            val idBytes = videoId.toByteArray(Charsets.UTF_8)
+            val framed = byteArrayOf(0x0a, idBytes.size.toByte()) + idBytes
+            return Base64.encodeToString(framed, Base64.NO_WRAP)
+        }
+
+        internal fun parseYouTubeTranscriptToLrc(root: JSONObject): String? {
+            val lines = mutableListOf<Pair<Long, String>>()
+
+            fun extractTextFromRuns(obj: JSONObject?): String {
+                if (obj == null) return ""
+                val simple = obj.optString("simpleText").trim()
+                if (simple.isNotBlank()) return simple
+                val runs = obj.optJSONArray("runs") ?: return ""
+                return buildString {
+                    for (i in 0 until runs.length()) {
+                        append(runs.optJSONObject(i)?.optString("text").orEmpty())
+                    }
+                }.trim()
+            }
+
+            fun walk(node: Any?) {
+                when (node) {
+                    is JSONObject -> {
+                        val seg = node.optJSONObject("transcriptSegmentRenderer")
+                        if (seg != null) {
+                            val startMs = seg.optString("startMs").toLongOrNull() ?: -1L
+                            val txt = extractTextFromRuns(seg.optJSONObject("snippet"))
+                                .replace("\n", " ")
+                                .trim()
+                            if (startMs >= 0L && txt.isNotBlank()) {
+                                lines.add(startMs to txt)
+                            }
+                        }
+                        val cue = node.optJSONObject("transcriptCueRenderer")
+                        if (cue != null) {
+                            val startMs = cue.optString("startOffsetMs").toLongOrNull() ?: -1L
+                            val txt = extractTextFromRuns(cue.optJSONObject("cue"))
+                                .replace("\n", " ")
+                                .trim()
+                            if (startMs >= 0L && txt.isNotBlank()) {
+                                lines.add(startMs to txt)
+                            }
+                        }
+                        val keys = node.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            if (k != "transcriptSegmentRenderer" && k != "transcriptCueRenderer") {
+                                walk(node.opt(k))
+                            }
+                        }
+                    }
+                    is JSONArray -> {
+                        for (i in 0 until node.length()) walk(node.opt(i))
+                    }
+                }
+            }
+
+            walk(root)
+            if (lines.size < 3) return null
+            return lines.sortedBy { it.first }.joinToString("\n") { (ms, text) ->
+                val totalSec = ms / 1000L
+                val min = totalSec / 60L
+                val sec = totalSec % 60L
+                val centis = (ms % 1000L) / 10L
+                String.format(Locale.US, "[%02d:%02d.%02d] %s", min, sec, centis, text)
+            }
+        }
+
         fun scoreCandidate(
             normExpectedTitle: String,
             normExpectedArtist: String,

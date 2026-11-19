@@ -3,7 +3,8 @@ package com.example.playback
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.os.Bundle
+import android.net.Uri
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -12,6 +13,9 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.datasource.cache.CacheDataSink
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -26,6 +30,7 @@ import androidx.media3.session.MediaSession
 import com.example.KoplingfyApplication
 import com.example.MainActivity
 import com.example.R
+import com.example.data.providers.youtube.YTPlayerUtils
 import com.example.widget.KoplingfyWidgetProvider
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
@@ -36,6 +41,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import java.io.IOException
 
 /**
  * Background Media3 MediaLibraryService powering:
@@ -82,8 +89,48 @@ class KoplingfyPlaybackService : MediaLibraryService() {
             }
         }.setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
 
+        // Metrolist-style DataSource pipeline:
+        // CacheDataSource (200MB LRU SimpleCache) -> ResolvingDataSource (on-the-fly YTPlayerUtils + 512KB chunking)
+        // -> DefaultDataSource -> OkHttpDataSource
         val okHttpFactory = OkHttpDataSource.Factory(container.mediaHttpClient)
-        val dataSourceFactory = DefaultDataSource.Factory(this, okHttpFactory)
+        val baseDataSourceFactory = DefaultDataSource.Factory(this, okHttpFactory)
+        val resolvingDataSourceFactory = ResolvingDataSource.Factory(baseDataSourceFactory) { dataSpec ->
+            val uri = dataSpec.uri
+            if (uri.scheme == YTPlayerUtils.METROLIST_URI_SCHEME && uri.host == YTPlayerUtils.METROLIST_URI_HOST) {
+                val videoId = uri.lastPathSegment.orEmpty()
+                if (videoId.isBlank()) throw IOException("Empty YouTube videoId in DataSpec")
+                val resolved = runBlocking(Dispatchers.IO) {
+                    container.youtubeMusicProvider.resolveForExoPlayer(videoId)
+                } ?: throw IOException("YTPlayerUtils failed to resolve stream for $videoId")
+
+                container.activeStreamUserAgent.set(
+                    resolved.userAgent.takeIf { it.isNotBlank() } ?: "Koplingfy/1.0.0 (Android; Media3)"
+                )
+                Log.d(
+                    "KoplingfyService",
+                    "ResolvingDataSource mapped $videoId -> ${resolved.clientName} (pos=${dataSpec.position})"
+                )
+                val targetUri = Uri.parse(resolved.streamUrl)
+                if (!resolved.isHls) {
+                    // Metrolist 512 KB chunked range requests avoid googlevideo single-stream throttling
+                    dataSpec.withUri(targetUri).subrange(dataSpec.uriPositionOffset, YTPlayerUtils.CHUNK_LENGTH)
+                } else {
+                    dataSpec.withUri(targetUri)
+                }
+            } else {
+                dataSpec
+            }
+        }
+
+        val cacheDataSinkFactory = CacheDataSink.Factory()
+            .setCache(container.playerCache)
+            .setFragmentSize(YTPlayerUtils.CHUNK_LENGTH)
+
+        val dataSourceFactory = CacheDataSource.Factory()
+            .setCache(container.playerCache)
+            .setUpstreamDataSourceFactory(resolvingDataSourceFactory)
+            .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(

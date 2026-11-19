@@ -20,6 +20,8 @@ import kotlinx.coroutines.launch
 
 data class ListenTogetherUiState(
     val activeRoom: ListenRoom? = null,
+    val isLocalLanRoom: Boolean = false,
+    val localPeerId: String = "",
     val myActiveRooms: List<ListenRoom> = emptyList(),
     val username: String = "",
     val isBusy: Boolean = false,
@@ -28,22 +30,35 @@ data class ListenTogetherUiState(
 )
 
 /**
- * Auth-gated real-time synchronization controller for "Dengarkan Bersama".
- * Never runs any Firestore listener or write unless Firebase.auth.currentUser != null.
+ * Dual-mode real-time synchronization controller for "Dengarkan Bersama":
+ * - Cloud Mode (Internet): strictly auth-gated behind Firebase Google Sign-In + Firestore.
+ * - Local Wi-Fi / Hotspot Mode: zero-login LAN TCP sync (works on every Android install even
+ *   when google-services.json is absent).
+ *
+ * Every Firebase call is safely guarded so missing Firebase initialization never causes a crash.
  */
 class ListenTogetherController(
     private val repositoryProvider: () -> ListenTogetherRepository,
     private val playbackController: PlaybackController,
-    private val settingsDataStore: SettingsDataStore
+    private val settingsDataStore: SettingsDataStore,
+    private val lanEngine: LocalLanListenTogetherEngine = LocalLanListenTogetherEngine()
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private val _state = MutableStateFlow(ListenTogetherUiState())
+    private val _state = MutableStateFlow(
+        ListenTogetherUiState(localPeerId = lanEngine.localPeerId)
+    )
     val state: StateFlow<ListenTogetherUiState> = _state.asStateFlow()
 
     private var activeRoomJob: Job? = null
     private var myRoomsJob: Job? = null
     private var lastAppliedSignature: String? = null
+
+    private fun safeFirebaseUid(): String? = runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
+
+    private fun safeRepository(): ListenTogetherRepository? = runCatching { repositoryProvider() }
+        .onFailure { Log.w("ListenTogether", "Firebase Firestore unavailable on this build", it) }
+        .getOrNull()
 
     init {
         scope.launch {
@@ -56,18 +71,36 @@ class ListenTogetherController(
 
         // Broadcast local playback changes when connected to an active Listen Together room
         playbackController.onLocalPlaybackAction = { track, isPlaying, posMs ->
-            val room = _state.value.activeRoom
-            val uid = runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
-            if (room != null && room.active && !uid.isNullOrBlank()) {
-                val uname = _state.value.username.ifBlank { room.memberNames[uid] ?: "Listener" }
-                scope.launch {
-                    repositoryProvider().syncPlaybackState(
-                        roomCode = room.roomCode,
-                        username = uname,
-                        track = track,
-                        playing = isPlaying,
-                        positionMs = posMs
-                    )
+            val currentState = _state.value
+            val room = currentState.activeRoom
+            if (room != null && room.active) {
+                if (currentState.isLocalLanRoom) {
+                    val uname = currentState.username.ifBlank {
+                        room.memberNames[lanEngine.localPeerId] ?: "Listener"
+                    }
+                    scope.launch {
+                        lanEngine.syncPlaybackState(
+                            username = uname,
+                            track = track,
+                            playing = isPlaying,
+                            positionMs = posMs
+                        )
+                    }
+                } else {
+                    val uid = safeFirebaseUid()
+                    val repo = if (!uid.isNullOrBlank()) safeRepository() else null
+                    if (!uid.isNullOrBlank() && repo != null) {
+                        val uname = currentState.username.ifBlank { room.memberNames[uid] ?: "Listener" }
+                        scope.launch {
+                            repo.syncPlaybackState(
+                                roomCode = room.roomCode,
+                                username = uname,
+                                track = track,
+                                playing = isPlaying,
+                                positionMs = posMs
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -78,10 +111,12 @@ class ListenTogetherController(
     }
 
     fun startObservingUserRooms(userId: String) {
-        if (userId.isBlank() || Firebase.auth.currentUser?.uid != userId) return
+        val currentUid = safeFirebaseUid()
+        if (userId.isBlank() || currentUid != userId) return
+        val repo = safeRepository() ?: return
         myRoomsJob?.cancel()
         myRoomsJob = scope.launch {
-            repositoryProvider().observeMyRooms(userId)
+            repo.observeMyRooms(userId)
                 .catch { err ->
                     val fsErr = generateSequence(err) { it.cause }
                         .filterIsInstance<FirebaseFirestoreException>()
@@ -104,12 +139,16 @@ class ListenTogetherController(
         myRoomsJob?.cancel()
         myRoomsJob = null
         lastAppliedSignature = null
+        lanEngine.stopHostServer()
         _state.value = _state.value.copy(
             activeRoom = null,
+            isLocalLanRoom = false,
             myActiveRooms = emptyList(),
             isBusy = false
         )
     }
+
+    // ==================== CLOUD MODE (FIREBASE FIRESTORE) ====================
 
     fun createRoom(username: String, roomName: String) {
         val cleanName = username.trim()
@@ -117,11 +156,19 @@ class ListenTogetherController(
             _state.value = _state.value.copy(errorMessage = "Masukkan username minimal 2 karakter.")
             return
         }
+        val repo = safeRepository()
+        if (repo == null) {
+            _state.value = _state.value.copy(
+                errorMessage = "Layanan Cloud belum tersedia di build ini. Gunakan mode Wi-Fi / Hotspot."
+            )
+            return
+        }
         scope.launch {
             _state.value = _state.value.copy(isBusy = true, errorMessage = null, statusMessage = null)
+            lanEngine.leaveOrClose()
             settingsDataStore.updateListenUsername(cleanName)
             val pb = playbackController.state.value
-            val res = repositoryProvider().createRoom(
+            val res = repo.createRoom(
                 username = cleanName,
                 roomName = roomName,
                 currentTrack = pb.currentTrack,
@@ -131,15 +178,16 @@ class ListenTogetherController(
             res.onSuccess { room ->
                 _state.value = _state.value.copy(
                     activeRoom = room,
+                    isLocalLanRoom = false,
                     username = cleanName,
                     isBusy = false,
-                    statusMessage = "Room ${room.roomCode} dibuat! Bagikan kode ke temanmu."
+                    statusMessage = "Room Cloud ${room.roomCode} dibuat! Bagikan kode ke temanmu."
                 )
-                observeActiveRoom(room.roomCode)
+                observeActiveCloudRoom(room.roomCode)
             }.onFailure { err ->
                 _state.value = _state.value.copy(
                     isBusy = false,
-                    errorMessage = err.localizedMessage ?: "Gagal membuat room"
+                    errorMessage = err.localizedMessage ?: "Gagal membuat room cloud"
                 )
             }
         }
@@ -156,20 +204,29 @@ class ListenTogetherController(
             _state.value = _state.value.copy(errorMessage = "Kode room harus 4–12 huruf/angka.")
             return
         }
+        val repo = safeRepository()
+        if (repo == null) {
+            _state.value = _state.value.copy(
+                errorMessage = "Layanan Cloud belum tersedia di build ini. Gunakan mode Wi-Fi / Hotspot."
+            )
+            return
+        }
         scope.launch {
             _state.value = _state.value.copy(isBusy = true, errorMessage = null, statusMessage = null)
+            lanEngine.leaveOrClose()
             settingsDataStore.updateListenUsername(cleanName)
-            val res = repositoryProvider().joinRoom(cleanCode, cleanName)
+            val res = repo.joinRoom(cleanCode, cleanName)
             res.onSuccess { room ->
                 lastAppliedSignature = null
                 _state.value = _state.value.copy(
                     activeRoom = room,
+                    isLocalLanRoom = false,
                     username = cleanName,
                     isBusy = false,
                     statusMessage = "Terhubung ke room ${room.roomCode}!"
                 )
                 applyRoomStateToLocalPlayer(room, forceApply = true)
-                observeActiveRoom(room.roomCode)
+                observeActiveCloudRoom(room.roomCode)
             }.onFailure { err ->
                 _state.value = _state.value.copy(
                     isBusy = false,
@@ -179,10 +236,11 @@ class ListenTogetherController(
         }
     }
 
-    private fun observeActiveRoom(roomCode: String) {
+    private fun observeActiveCloudRoom(roomCode: String) {
+        val repo = safeRepository() ?: return
         activeRoomJob?.cancel()
         activeRoomJob = scope.launch {
-            repositoryProvider().observeRoom(roomCode)
+            repo.observeRoom(roomCode)
                 .catch { err ->
                     val fsErr = generateSequence(err) { it.cause }
                         .filterIsInstance<FirebaseFirestoreException>()
@@ -197,20 +255,122 @@ class ListenTogetherController(
                     if (room == null || !room.active) {
                         _state.value = _state.value.copy(
                             activeRoom = null,
+                            isLocalLanRoom = false,
                             statusMessage = "Room telah ditutup oleh host."
                         )
                         activeRoomJob?.cancel()
                         return@collect
                     }
-                    _state.value = _state.value.copy(activeRoom = room)
-                    val myUid = runCatching { Firebase.auth.currentUser?.uid }.getOrNull()
-                    // Apply updates originating from other participants
+                    _state.value = _state.value.copy(activeRoom = room, isLocalLanRoom = false)
+                    val myUid = safeFirebaseUid()
                     if (room.updatedByUid != myUid) {
                         applyRoomStateToLocalPlayer(room, forceApply = false)
                     }
                 }
         }
     }
+
+    // ==================== LOCAL WI-FI / HOTSPOT MODE (NO LOGIN) ====================
+
+    fun createLocalLanRoom(username: String, roomName: String) {
+        val cleanName = username.trim()
+        if (cleanName.length < 2) {
+            _state.value = _state.value.copy(errorMessage = "Masukkan username minimal 2 karakter.")
+            return
+        }
+        scope.launch {
+            _state.value = _state.value.copy(isBusy = true, errorMessage = null, statusMessage = null)
+            activeRoomJob?.cancel()
+            settingsDataStore.updateListenUsername(cleanName)
+            val pb = playbackController.state.value
+            val res = lanEngine.startHostRoom(
+                username = cleanName,
+                roomName = roomName,
+                currentTrack = pb.currentTrack,
+                isPlaying = pb.isPlaying,
+                positionMs = pb.positionMs
+            )
+            res.onSuccess { room ->
+                lastAppliedSignature = null
+                _state.value = _state.value.copy(
+                    activeRoom = room,
+                    isLocalLanRoom = true,
+                    username = cleanName,
+                    isBusy = false,
+                    statusMessage = "Room Wi-Fi ${room.roomCode} aktif! Bagikan kode ke teman di Wi-Fi/Hotspot yang sama."
+                )
+                observeLocalLanRoom(isHost = true)
+            }.onFailure { err ->
+                _state.value = _state.value.copy(
+                    isBusy = false,
+                    errorMessage = err.localizedMessage ?: "Gagal membuat room Wi-Fi lokal"
+                )
+            }
+        }
+    }
+
+    fun joinLocalLanRoom(roomCode: String, username: String) {
+        val cleanName = username.trim()
+        if (cleanName.length < 2) {
+            _state.value = _state.value.copy(errorMessage = "Masukkan username minimal 2 karakter.")
+            return
+        }
+        scope.launch {
+            _state.value = _state.value.copy(isBusy = true, errorMessage = null, statusMessage = null)
+            activeRoomJob?.cancel()
+            settingsDataStore.updateListenUsername(cleanName)
+            val res = lanEngine.joinLanRoom(roomCode, cleanName)
+            res.onSuccess { room ->
+                lastAppliedSignature = null
+                _state.value = _state.value.copy(
+                    activeRoom = room,
+                    isLocalLanRoom = true,
+                    username = cleanName,
+                    isBusy = false,
+                    statusMessage = "Terhubung ke room Wi-Fi ${room.roomCode}!"
+                )
+                applyRoomStateToLocalPlayer(room, forceApply = true)
+                observeLocalLanRoom(isHost = false)
+            }.onFailure { err ->
+                _state.value = _state.value.copy(
+                    isBusy = false,
+                    errorMessage = err.localizedMessage ?: "Gagal terhubung ke room Wi-Fi"
+                )
+            }
+        }
+    }
+
+    private fun observeLocalLanRoom(isHost: Boolean) {
+        activeRoomJob?.cancel()
+        val flow = if (isHost) lanEngine.observeHostRoom() else lanEngine.observeRemoteLanRoom()
+        activeRoomJob = scope.launch {
+            flow.catch { err ->
+                if (err is CancellationException) throw err
+                Log.w("ListenTogether", "Local LAN listener error", err)
+                _state.value = _state.value.copy(
+                    errorMessage = err.localizedMessage ?: "Koneksi Wi-Fi ke host terputus"
+                )
+            }.collect { room ->
+                if (room == null || !room.active) {
+                    if (_state.value.isLocalLanRoom && _state.value.activeRoom != null) {
+                        _state.value = _state.value.copy(
+                            activeRoom = null,
+                            isLocalLanRoom = false,
+                            statusMessage = "Room Wi-Fi ditutup atau host terputus."
+                        )
+                    }
+                    activeRoomJob?.cancel()
+                    return@collect
+                }
+                _state.value = _state.value.copy(activeRoom = room, isLocalLanRoom = true)
+                if (room.updatedByUid != lanEngine.localPeerId) {
+                    applyRoomStateToLocalPlayer(room, forceApply = false)
+                }
+            }
+        }
+    }
+
+    // ==================== SHARED ROOM CONTROLS ====================
 
     fun forceResyncNow() {
         val room = _state.value.activeRoom ?: return
@@ -220,17 +380,33 @@ class ListenTogetherController(
     }
 
     fun pushCurrentTrackToRoom() {
-        val room = _state.value.activeRoom ?: return
+        val currentState = _state.value
+        val room = currentState.activeRoom ?: return
         val pb = playbackController.state.value
-        val uname = _state.value.username.ifBlank { "Listener" }
+        val uname = currentState.username.ifBlank { "Listener" }
         scope.launch {
-            repositoryProvider().syncPlaybackState(
-                roomCode = room.roomCode,
-                username = uname,
-                track = pb.currentTrack,
-                playing = pb.isPlaying,
-                positionMs = pb.positionMs
-            ).onSuccess {
+            val res = if (currentState.isLocalLanRoom) {
+                lanEngine.syncPlaybackState(
+                    username = uname,
+                    track = pb.currentTrack,
+                    playing = pb.isPlaying,
+                    positionMs = pb.positionMs
+                )
+            } else {
+                val repo = safeRepository()
+                if (repo == null) {
+                    Result.failure(IllegalStateException("Koneksi Cloud tidak tersedia."))
+                } else {
+                    repo.syncPlaybackState(
+                        roomCode = room.roomCode,
+                        username = uname,
+                        track = pb.currentTrack,
+                        playing = pb.isPlaying,
+                        positionMs = pb.positionMs
+                    )
+                }
+            }
+            res.onSuccess {
                 _state.value = _state.value.copy(statusMessage = "Lagu saat ini disinkronkan ke semua anggota.")
             }.onFailure { err ->
                 _state.value = _state.value.copy(errorMessage = err.localizedMessage ?: "Gagal menyinkronkan")
@@ -239,15 +415,21 @@ class ListenTogetherController(
     }
 
     fun leaveCurrentRoom() {
-        val room = _state.value.activeRoom ?: return
+        val currentState = _state.value
+        val room = currentState.activeRoom ?: return
         scope.launch {
             _state.value = _state.value.copy(isBusy = true)
             activeRoomJob?.cancel()
             activeRoomJob = null
-            repositoryProvider().leaveRoom(room.roomCode)
+            if (currentState.isLocalLanRoom) {
+                lanEngine.leaveOrClose()
+            } else {
+                safeRepository()?.leaveRoom(room.roomCode)
+            }
             lastAppliedSignature = null
             _state.value = _state.value.copy(
                 activeRoom = null,
+                isLocalLanRoom = false,
                 isBusy = false,
                 statusMessage = "Keluar dari room ${room.roomCode}"
             )
@@ -255,15 +437,21 @@ class ListenTogetherController(
     }
 
     fun closeCurrentRoom() {
-        val room = _state.value.activeRoom ?: return
+        val currentState = _state.value
+        val room = currentState.activeRoom ?: return
         scope.launch {
             _state.value = _state.value.copy(isBusy = true)
             activeRoomJob?.cancel()
             activeRoomJob = null
-            repositoryProvider().closeRoom(room.roomCode)
+            if (currentState.isLocalLanRoom) {
+                lanEngine.leaveOrClose()
+            } else {
+                safeRepository()?.closeRoom(room.roomCode)
+            }
             lastAppliedSignature = null
             _state.value = _state.value.copy(
                 activeRoom = null,
+                isLocalLanRoom = false,
                 isBusy = false,
                 statusMessage = "Room ${room.roomCode} telah ditutup."
             )

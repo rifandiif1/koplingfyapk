@@ -19,6 +19,8 @@ import com.example.data.local.db.TrackEntity
 import com.example.data.local.prefs.SettingsDataStore
 import com.example.data.providers.MultiSourceRepository
 import com.example.data.providers.ResolvedStream
+import com.example.data.providers.youtube.YTPlayerUtils
+import com.example.domain.model.MusicSource
 import com.example.domain.model.RepeatModeState
 import com.example.domain.model.Track
 import com.google.common.util.concurrent.ListenableFuture
@@ -439,18 +441,33 @@ class PlaybackController(
             }
             .build()
 
+        val mime = stream.mimeType
+        val isHlsUrl = mime == "application/x-mpegURL" ||
+            stream.url.contains("m3u8", ignoreCase = true) ||
+            stream.url.contains("hls_playlist", ignoreCase = true)
+        val isDashUrl = mime == "application/dash+xml"
+
+        val ytVideoId = if (track.source == MusicSource.YOUTUBE_MUSIC && track.localPath.isNullOrBlank()) {
+            track.sourceTrackId.takeIf { it.isNotBlank() } ?: track.id.removePrefix("ytm_")
+        } else null
+
         val itemBuilder = MediaItem.Builder()
             .setMediaId(track.id)
-            .setUri(Uri.parse(stream.url))
             .setMediaMetadata(metadata)
 
-        // Force explicit MIME type for adaptive manifests (HLS/DASH); let Media3 auto-sniff progressive audio
-        val mime = stream.mimeType
-        val isHlsUrl = stream.url.contains("m3u8", ignoreCase = true) ||
-            stream.url.contains("hls_playlist", ignoreCase = true)
-        when {
-            mime == "application/x-mpegURL" || isHlsUrl -> itemBuilder.setMimeType("application/x-mpegURL")
-            mime == "application/dash+xml" -> itemBuilder.setMimeType(mime)
+        val isMetrolistDirect = ytVideoId != null && !isHlsUrl && !isDashUrl && stream.tierIndex <= 3
+        if (isMetrolistDirect) {
+            // Metrolist pipeline: route direct googlevideo streams through CacheDataSource + ResolvingDataSource (512KB chunked)
+            val containerTag = if (mime?.contains("webm", ignoreCase = true) == true) "webm" else "mp4"
+            itemBuilder
+                .setUri(Uri.parse(YTPlayerUtils.buildInternalTrackUri(ytVideoId!!)))
+                .setCustomCacheKey("${ytVideoId}_${containerTag}")
+        } else {
+            itemBuilder.setUri(Uri.parse(stream.url))
+            when {
+                isHlsUrl -> itemBuilder.setMimeType("application/x-mpegURL")
+                isDashUrl -> itemBuilder.setMimeType("application/dash+xml")
+            }
         }
 
         controller.setMediaItem(itemBuilder.build())

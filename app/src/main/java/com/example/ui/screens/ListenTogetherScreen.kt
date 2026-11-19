@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
@@ -30,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ExitToApp
+import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Group
@@ -43,6 +45,7 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Tag
+import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -88,7 +91,6 @@ import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.R
 import com.example.data.remote.ListenRoom
 import com.example.ui.components.TrackArtwork
 import com.example.ui.viewmodel.MainViewModel
@@ -97,6 +99,7 @@ import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
@@ -107,6 +110,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ListenTogetherScreen(
     viewModel: MainViewModel,
@@ -114,221 +118,40 @@ fun ListenTogetherScreen(
     onOpenNowPlaying: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val auth = remember { Firebase.auth }
-    var currentUser by remember { mutableStateOf<FirebaseUser?>(auth.currentUser) }
-
-    DisposableEffect(auth) {
-        val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
-            currentUser = firebaseAuth.currentUser
-        }
-        auth.addAuthStateListener(listener)
-        onDispose { auth.removeAuthStateListener(listener) }
-    }
-
-    val user = currentUser
-    if (user == null) {
-        // Unauthenticated gate: zero Firestore queries or listeners run here
-        ListenTogetherAuthGate(
-            onAuthSuccess = { currentUser = Firebase.auth.currentUser },
-            modifier = modifier
-        )
-    } else {
-        key(user.uid) {
-            ListenTogetherStudioContent(
-                viewModel = viewModel,
-                currentUser = user,
-                onOpenSearch = onOpenSearch,
-                onOpenNowPlaying = onOpenNowPlaying,
-                onSignedOut = { currentUser = null },
-                modifier = modifier
-            )
-        }
-    }
-}
-
-@Composable
-private fun ListenTogetherAuthGate(
-    onAuthSuccess: () -> Unit,
-    modifier: Modifier = Modifier
-) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val credentialManager = remember { CredentialManager.create(context) }
-    var isLoading by remember { mutableStateOf(false) }
-    var authError by remember { mutableStateOf<String?>(null) }
 
-    // Silent auto sign-in check for returning users (separate single-option request)
-    LaunchedEffect(Unit) {
-        attemptSilentGoogleSignIn(
-            context = context,
-            credentialManager = credentialManager,
-            onAuthSuccess = onAuthSuccess
-        )
+    // Crash-safe FirebaseAuth lookup: returns null instead of throwing IllegalStateException
+    // when an APK is built without google-services.json (e.g. GitHub Actions CI without secret).
+    val firebaseAuth = remember(context) { safeGetFirebaseAuth(context) }
+    val firebaseAvailable = firebaseAuth != null
+    val credentialManager = remember(context) {
+        runCatching { CredentialManager.create(context) }.getOrNull()
     }
 
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(
-                        MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
-                        MaterialTheme.colorScheme.background,
-                        MaterialTheme.colorScheme.background
-                    )
-                )
-            )
-            .padding(24.dp)
-            .testTag("listen_together_auth_gate"),
-        contentAlignment = Alignment.Center
-    ) {
-        Card(
-            shape = RoundedCornerShape(28.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f)
-            ),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.30f)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(26.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
-                    modifier = Modifier.size(76.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Rounded.Headphones,
-                            contentDescription = "Dengarkan Bersama",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(38.dp)
-                        )
-                    }
-                }
+    var currentUser by remember(firebaseAuth) { mutableStateOf<FirebaseUser?>(firebaseAuth?.currentUser) }
 
-                Text(
-                    text = "Dengarkan Bersama",
-                    style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center
-                )
-                Text(
-                    text = "Putar lagu YouTube Music yang sama secara real-time bersama teman. Cukup buat Username & bagikan Kode Room — posisi putar dan jeda langsung sinkron otomatis.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center
-                )
-
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = "Pemutar musik lokal & YouTube tetap bisa dipakai tanpa login. Masuk Google hanya diperlukan untuk sinkronisasi room cloud antar perangkat.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-
-                authError?.let { err ->
-                    Text(
-                        text = err,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                        textAlign = TextAlign.Center
-                    )
-                }
-
-                Button(
-                    onClick = {
-                        isLoading = true
-                        authError = null
-                        launchInteractiveGoogleSignIn(
-                            context = context,
-                            credentialManager = credentialManager,
-                            scope = scope,
-                            onSuccess = {
-                                isLoading = false
-                                onAuthSuccess()
-                            },
-                            onCancelled = {
-                                isLoading = false
-                            },
-                            onError = { msg ->
-                                isLoading = false
-                                authError = msg
-                            }
-                        )
-                    },
-                    enabled = !isLoading,
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp)
-                        .testTag("listen_together_google_signin_btn")
-                ) {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(22.dp),
-                            color = MaterialTheme.colorScheme.onPrimary,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(Icons.Rounded.Login, contentDescription = null)
-                        Spacer(Modifier.width(10.dp))
-                        Text(
-                            text = "Masuk dengan Google untuk Sinkronisasi",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
+    DisposableEffect(firebaseAuth) {
+        if (firebaseAuth == null) {
+            onDispose { }
+        } else {
+            val listener = FirebaseAuth.AuthStateListener { auth ->
+                currentUser = auth.currentUser
             }
+            firebaseAuth.addAuthStateListener(listener)
+            onDispose { firebaseAuth.removeAuthStateListener(listener) }
         }
     }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun ListenTogetherStudioContent(
-    viewModel: MainViewModel,
-    currentUser: FirebaseUser,
-    onOpenSearch: () -> Unit,
-    onOpenNowPlaying: () -> Unit,
-    onSignedOut: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val credentialManager = remember { CredentialManager.create(context) }
 
     val controller = viewModel.container.listenTogetherController
     val uiState by viewModel.listenTogetherState.collectAsStateWithLifecycle()
     val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
 
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Buat Room, 1 = Gabung Kode
+    // 0 = Wi-Fi / Hotspot Lokal (Tanpa Login), 1 = Cloud Internet (Firebase + Google Sign-In)
+    var syncMode by remember(firebaseAvailable) { mutableIntStateOf(if (firebaseAvailable) 1 else 0) }
+    var actionTab by remember { mutableIntStateOf(0) } // 0 = Buat Room, 1 = Gabung Kode
     var roomNameInput by remember { mutableStateOf("") }
     var joinCodeInput by remember { mutableStateOf("") }
-
-    LaunchedEffect(currentUser.uid) {
-        if (uiState.username.isBlank()) {
-            val defaultName = currentUser.displayName?.substringBefore(" ")?.take(24) ?: "Listener"
-            controller.updateUsernameDraft(defaultName)
-        }
-        controller.startObservingUserRooms(currentUser.uid)
-    }
 
     LaunchedEffect(uiState.statusMessage) {
         uiState.statusMessage?.let {
@@ -337,13 +160,32 @@ private fun ListenTogetherStudioContent(
         }
     }
 
+    // Observe user's Cloud rooms strictly when signed in with non-blank UID
+    LaunchedEffect(currentUser?.uid) {
+        val u = currentUser
+        if (u != null && u.uid.isNotBlank()) {
+            if (uiState.username.isBlank()) {
+                val defaultName = u.displayName?.substringBefore(" ")?.take(24) ?: "Listener"
+                controller.updateUsernameDraft(defaultName)
+            }
+            controller.startObservingUserRooms(u.uid)
+        }
+    }
+
+    val activeRoom = uiState.activeRoom
+    val activeParticipantUid = if (uiState.isLocalLanRoom) {
+        uiState.localPeerId
+    } else {
+        currentUser?.uid.orEmpty()
+    }
+
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
                     listOf(
-                        MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
                         MaterialTheme.colorScheme.background,
                         MaterialTheme.colorScheme.background
                     )
@@ -372,22 +214,30 @@ private fun ListenTogetherStudioContent(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                TextButton(
-                    onClick = {
-                        scope.launch {
-                            withContext(NonCancellable) {
-                                controller.stopAllListeners()
-                                runCatching { credentialManager.clearCredentialState(ClearCredentialStateRequest()) }
-                                Firebase.auth.signOut()
-                                onSignedOut()
+                if (firebaseAuth != null && currentUser != null) {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                withContext(NonCancellable) {
+                                    controller.stopAllListeners()
+                                    runCatching {
+                                        credentialManager?.clearCredentialState(ClearCredentialStateRequest())
+                                    }
+                                    runCatching { firebaseAuth.signOut() }
+                                    currentUser = null
+                                }
                             }
-                        }
-                    },
-                    modifier = Modifier.testTag("listen_together_signout_btn")
-                ) {
-                    Icon(Icons.AutoMirrored.Rounded.ExitToApp, contentDescription = "Keluar akun", modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Ganti Akun")
+                        },
+                        modifier = Modifier.testTag("listen_together_signout_btn")
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Rounded.ExitToApp,
+                            contentDescription = "Keluar akun",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("Ganti Akun")
+                    }
                 }
             }
         }
@@ -410,27 +260,36 @@ private fun ListenTogetherStudioContent(
             }
         }
 
-        val activeRoom = uiState.activeRoom
         if (activeRoom != null) {
-            // ACTIVE ROOM DASHBOARD
+            // ==================== ACTIVE ROOM DASHBOARD (BOTH LAN & CLOUD) ====================
             item {
                 ActiveRoomHeroCard(
                     room = activeRoom,
-                    isHost = activeRoom.hostUid == currentUser.uid,
+                    isHost = activeRoom.hostUid == activeParticipantUid,
+                    isLocalLan = uiState.isLocalLanRoom,
                     onCopyCode = {
-                        val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        cb.setPrimaryClip(ClipData.newPlainText("Koplingfy Room Code", activeRoom.roomCode))
+                        runCatching {
+                            val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cb?.setPrimaryClip(ClipData.newPlainText("Koplingfy Room Code", activeRoom.roomCode))
+                        }
                         viewModel.showMessage("Kode room ${activeRoom.roomCode} disalin!")
                     },
                     onShareCode = {
-                        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(
-                                Intent.EXTRA_TEXT,
-                                "Ayo dengarkan musik bareng di KOPLINGFY! Masukkan kode room: ${activeRoom.roomCode}"
-                            )
+                        runCatching {
+                            val modeHint = if (uiState.isLocalLanRoom) {
+                                "Pastikan kita di Wi-Fi/Hotspot yang sama, lalu masukkan kode: ${activeRoom.roomCode}"
+                            } else {
+                                "Masukkan kode room: ${activeRoom.roomCode}"
+                            }
+                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(
+                                    Intent.EXTRA_TEXT,
+                                    "Ayo dengarkan musik bareng di KOPLINGFY! $modeHint"
+                                )
+                            }
+                            context.startActivity(Intent.createChooser(sendIntent, "Bagikan Kode Room"))
                         }
-                        context.startActivity(Intent.createChooser(sendIntent, "Bagikan Kode Room"))
                     }
                 )
             }
@@ -504,21 +363,23 @@ private fun ListenTogetherStudioContent(
                                         Icon(
                                             imageVector = Icons.Rounded.GraphicEq,
                                             contentDescription = null,
-                                            tint = if (activeRoom.playing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            tint = if (activeRoom.playing) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant,
                                             modifier = Modifier.size(14.dp)
                                         )
                                         Spacer(Modifier.width(4.dp))
                                         Text(
                                             text = if (activeRoom.playing) "Sedang Berjalan Sinkron" else "Dijeda",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (activeRoom.playing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                            color = if (activeRoom.playing) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                 }
                             }
                         } else {
                             Text(
-                                text = "Belum ada lagu di room. Pilih lagu di menu Search atau kirim lagu yang sedang Anda putar!",
+                                text = "Belum ada lagu di room. Pilih lagu di menu Cari atau kirim lagu yang sedang Anda putar!",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -530,7 +391,9 @@ private fun ListenTogetherStudioContent(
                         ) {
                             FilledTonalButton(
                                 onClick = { controller.forceResyncNow() },
-                                modifier = Modifier.weight(1f).testTag("listen_resync_btn")
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("listen_resync_btn")
                             ) {
                                 Icon(Icons.Rounded.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
@@ -544,7 +407,9 @@ private fun ListenTogetherStudioContent(
                                         onOpenSearch()
                                     }
                                 },
-                                modifier = Modifier.weight(1f).testTag("listen_pick_or_push_btn")
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("listen_pick_or_push_btn")
                             ) {
                                 Icon(
                                     if (playbackState.currentTrack != null) Icons.Rounded.PlayArrow else Icons.Rounded.Search,
@@ -597,7 +462,7 @@ private fun ListenTogetherStudioContent(
                             activeRoom.memberUids.forEach { memberUid ->
                                 val memberName = activeRoom.memberNames[memberUid] ?: "Listener"
                                 val isRoomHost = memberUid == activeRoom.hostUid
-                                val isMe = memberUid == currentUser.uid
+                                val isMe = memberUid == activeParticipantUid
                                 Surface(
                                     shape = RoundedCornerShape(50),
                                     color = if (isRoomHost) MaterialTheme.colorScheme.primaryContainer
@@ -649,11 +514,14 @@ private fun ListenTogetherStudioContent(
                     OutlinedButton(
                         onClick = { controller.leaveCurrentRoom() },
                         enabled = !uiState.isBusy,
-                        modifier = Modifier.weight(1f).height(48.dp).testTag("listen_leave_room_btn")
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("listen_leave_room_btn")
                     ) {
                         Text("Keluar Room")
                     }
-                    if (activeRoom.hostUid == currentUser.uid) {
+                    if (activeRoom.hostUid == activeParticipantUid) {
                         Button(
                             onClick = { controller.closeCurrentRoom() },
                             enabled = !uiState.isBusy,
@@ -661,7 +529,10 @@ private fun ListenTogetherStudioContent(
                                 containerColor = MaterialTheme.colorScheme.error,
                                 contentColor = MaterialTheme.colorScheme.onError
                             ),
-                            modifier = Modifier.weight(1f).height(48.dp).testTag("listen_close_room_btn")
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("listen_close_room_btn")
                         ) {
                             Icon(Icons.Rounded.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
@@ -671,188 +542,168 @@ private fun ListenTogetherStudioContent(
                 }
             }
         } else {
-            // LOBBY: USERNAME + CREATE ROOM / JOIN BY CODE
+            // ==================== MODE SELECTOR (WI-FI LOKAL VS CLOUD) ====================
             item {
-                Card(
-                    shape = RoundedCornerShape(24.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)),
-                    modifier = Modifier.fillMaxWidth()
+                SingleChoiceSegmentedButtonRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("listen_mode_selector")
                 ) {
-                    Column(
-                        modifier = Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    SegmentedButton(
+                        selected = syncMode == 0,
+                        onClick = {
+                            syncMode = 0
+                            controller.clearMessages()
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                        icon = { Icon(Icons.Rounded.Wifi, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                        modifier = Modifier.testTag("listen_mode_lan")
                     ) {
-                        Text(
-                            text = "Identitas Pendengar",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        OutlinedTextField(
-                            value = uiState.username,
-                            onValueChange = { controller.updateUsernameDraft(it) },
-                            label = { Text("Username Anda") },
-                            placeholder = { Text("cth. Rifandi") },
-                            leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
-                            singleLine = true,
-                            shape = RoundedCornerShape(16.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("listen_username_input")
-                        )
-
-                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                            SegmentedButton(
-                                selected = selectedTab == 0,
-                                onClick = { selectedTab = 0 },
-                                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
-                                modifier = Modifier.testTag("listen_tab_create")
-                            ) {
-                                Text("Buat Room")
-                            }
-                            SegmentedButton(
-                                selected = selectedTab == 1,
-                                onClick = { selectedTab = 1 },
-                                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
-                                modifier = Modifier.testTag("listen_tab_join")
-                            ) {
-                                Text("Gabung Kode")
-                            }
-                        }
-
-                        AnimatedVisibility(visible = selectedTab == 0) {
-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                OutlinedTextField(
-                                    value = roomNameInput,
-                                    onValueChange = { roomNameInput = it.take(60) },
-                                    label = { Text("Nama Room (Opsional)") },
-                                    placeholder = { Text("cth. Nongkrong Malam") },
-                                    singleLine = true,
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                Button(
-                                    onClick = { controller.createRoom(uiState.username, roomNameInput) },
-                                    enabled = !uiState.isBusy && uiState.username.trim().length >= 2,
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(52.dp)
-                                        .testTag("listen_create_room_btn")
-                                ) {
-                                    if (uiState.isBusy) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(22.dp),
-                                            color = MaterialTheme.colorScheme.onPrimary,
-                                            strokeWidth = 2.dp
-                                        )
-                                    } else {
-                                        Icon(Icons.Rounded.Headphones, contentDescription = null)
-                                        Spacer(Modifier.width(8.dp))
-                                        Text("Buat Room & Dapatkan Kode", fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        }
-
-                        AnimatedVisibility(visible = selectedTab == 1) {
-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                OutlinedTextField(
-                                    value = joinCodeInput,
-                                    onValueChange = {
-                                        joinCodeInput = it.uppercase().replace(Regex("[^A-Z0-9]"), "").take(12)
-                                    },
-                                    label = { Text("Kode Sinkronisasi Room") },
-                                    placeholder = { Text("cth. KPL84X") },
-                                    leadingIcon = { Icon(Icons.Rounded.Tag, contentDescription = null) },
-                                    singleLine = true,
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("listen_join_code_input")
-                                )
-                                Button(
-                                    onClick = { controller.joinRoom(joinCodeInput, uiState.username) },
-                                    enabled = !uiState.isBusy && uiState.username.trim().length >= 2 && joinCodeInput.length >= 4,
-                                    shape = RoundedCornerShape(16.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(52.dp)
-                                        .testTag("listen_join_room_btn")
-                                ) {
-                                    if (uiState.isBusy) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(22.dp),
-                                            color = MaterialTheme.colorScheme.onPrimary,
-                                            strokeWidth = 2.dp
-                                        )
-                                    } else {
-                                        Icon(Icons.Rounded.Sync, contentDescription = null)
-                                        Spacer(Modifier.width(8.dp))
-                                        Text("Gabung & Sinkronkan", fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        }
+                        Text("Wi-Fi / Hotspot", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    SegmentedButton(
+                        selected = syncMode == 1,
+                        onClick = {
+                            syncMode = 1
+                            controller.clearMessages()
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                        icon = { Icon(Icons.Rounded.Cloud, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                        modifier = Modifier.testTag("listen_mode_cloud")
+                    ) {
+                        Text("Cloud Internet", maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }
 
-            // Rejoin user's previously active rooms
-            if (uiState.myActiveRooms.isNotEmpty()) {
+            if (syncMode == 0) {
+                // ==================== LOCAL WI-FI / HOTSPOT LOBBY (ZERO LOGIN, ZERO CRASH) ====================
                 item {
-                    Text(
-                        text = "Room Aktif Anda",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
+                    RoomLobbyCard(
+                        badgeText = "TANPA LOGIN • WI-FI / HOTSPOT LOKAL",
+                        helperText = "Buat atau gabung room dengan teman di jaringan Wi-Fi atau Hotspot yang sama tanpa perlu login akun.",
+                        username = uiState.username,
+                        onUsernameChange = { controller.updateUsernameDraft(it) },
+                        actionTab = actionTab,
+                        onSelectTab = { actionTab = it },
+                        roomNameInput = roomNameInput,
+                        onRoomNameChange = { roomNameInput = it.take(60) },
+                        joinCodeInput = joinCodeInput,
+                        onJoinCodeChange = {
+                            joinCodeInput = it.uppercase().replace(Regex("[^A-Z0-9.:]"), "").take(24)
+                        },
+                        joinPlaceholder = "cth. W2F8K9P1M4",
+                        isBusy = uiState.isBusy,
+                        onCreateRoom = { controller.createLocalLanRoom(uiState.username, roomNameInput) },
+                        onJoinRoom = { controller.joinLocalLanRoom(joinCodeInput, uiState.username) }
                     )
                 }
-                items(uiState.myActiveRooms, key = { it.roomCode }) { room ->
-                    Card(
-                        shape = RoundedCornerShape(18.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                controller.joinRoom(room.roomCode, uiState.username.ifBlank { room.hostUsername })
-                            }
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(14.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer
+            } else {
+                // ==================== CLOUD INTERNET MODE (FIREBASE + GOOGLE SIGN-IN) ====================
+                if (firebaseAuth == null) {
+                    item {
+                        CloudUnavailableCard(
+                            onSwitchToLocalWifi = { syncMode = 0 }
+                        )
+                    }
+                } else if (currentUser == null) {
+                    item {
+                        ListenTogetherCloudAuthCard(
+                            firebaseAuth = firebaseAuth,
+                            credentialManager = credentialManager,
+                            onAuthSuccess = { currentUser = firebaseAuth.currentUser },
+                            onSwitchToLocalWifi = { syncMode = 0 }
+                        )
+                    }
+                } else {
+                    val signedInUser = currentUser!!
+                    item {
+                        key(signedInUser.uid) {
+                            RoomLobbyCard(
+                                badgeText = "CLOUD SINKRON • JARAK JAUH",
+                                helperText = "Dengarkan lagu yang sama bersama teman di mana saja lewat internet dengan kode room 6 karakter.",
+                                username = uiState.username,
+                                onUsernameChange = { controller.updateUsernameDraft(it) },
+                                actionTab = actionTab,
+                                onSelectTab = { actionTab = it },
+                                roomNameInput = roomNameInput,
+                                onRoomNameChange = { roomNameInput = it.take(60) },
+                                joinCodeInput = joinCodeInput,
+                                onJoinCodeChange = {
+                                    joinCodeInput = it.uppercase().replace(Regex("[^A-Z0-9]"), "").take(12)
+                                },
+                                joinPlaceholder = "cth. KPL84X",
+                                isBusy = uiState.isBusy,
+                                onCreateRoom = { controller.createRoom(uiState.username, roomNameInput) },
+                                onJoinRoom = { controller.joinRoom(joinCodeInput, uiState.username) }
+                            )
+                        }
+                    }
+
+                    // Rejoin user's previously active cloud rooms
+                    if (uiState.myActiveRooms.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "Room Cloud Aktif Anda",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        items(
+                            items = uiState.myActiveRooms,
+                            key = { it.id.ifBlank { it.roomCode } }
+                        ) { room ->
+                            Card(
+                                shape = RoundedCornerShape(18.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        controller.joinRoom(room.roomCode, uiState.username.ifBlank { room.hostUsername })
+                                    }
                             ) {
-                                Text(
-                                    text = room.roomCode,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                                )
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = MaterialTheme.colorScheme.primaryContainer
+                                    ) {
+                                        Text(
+                                            text = room.roomCode,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = room.roomName.ifBlank { "Room ${room.roomCode}" },
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "${room.memberUids.size} pendengar • ${room.trackTitle.ifBlank { "Menunggu lagu" }}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Icon(
+                                        Icons.Rounded.PlayArrow,
+                                        contentDescription = "Masuk kembali",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
                             }
-                            Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = room.roomName.ifBlank { "Room ${room.roomCode}" },
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = "${room.memberUids.size} pendengar • ${room.trackTitle.ifBlank { "Menunggu lagu" }}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            Icon(Icons.Rounded.PlayArrow, contentDescription = "Masuk kembali", tint = MaterialTheme.colorScheme.primary)
                         }
                     }
                 }
@@ -862,9 +713,368 @@ private fun ListenTogetherStudioContent(
 }
 
 @Composable
+private fun RoomLobbyCard(
+    badgeText: String,
+    helperText: String,
+    username: String,
+    onUsernameChange: (String) -> Unit,
+    actionTab: Int,
+    onSelectTab: (Int) -> Unit,
+    roomNameInput: String,
+    onRoomNameChange: (String) -> Unit,
+    joinCodeInput: String,
+    onJoinCodeChange: (String) -> Unit,
+    joinPlaceholder: String,
+    isBusy: Boolean,
+    onCreateRoom: () -> Unit,
+    onJoinRoom: () -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
+            ) {
+                Text(
+                    text = badgeText,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
+                )
+            }
+
+            Text(
+                text = helperText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            OutlinedTextField(
+                value = username,
+                onValueChange = onUsernameChange,
+                label = { Text("Username Anda") },
+                placeholder = { Text("cth. Rifandi") },
+                leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null) },
+                singleLine = true,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("listen_username_input")
+            )
+
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                SegmentedButton(
+                    selected = actionTab == 0,
+                    onClick = { onSelectTab(0) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                    modifier = Modifier.testTag("listen_tab_create")
+                ) {
+                    Text("Buat Room")
+                }
+                SegmentedButton(
+                    selected = actionTab == 1,
+                    onClick = { onSelectTab(1) },
+                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                    modifier = Modifier.testTag("listen_tab_join")
+                ) {
+                    Text("Gabung Kode")
+                }
+            }
+
+            AnimatedVisibility(visible = actionTab == 0) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = roomNameInput,
+                        onValueChange = onRoomNameChange,
+                        label = { Text("Nama Room (Opsional)") },
+                        placeholder = { Text("cth. Nongkrong Malam") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = onCreateRoom,
+                        enabled = !isBusy && username.trim().length >= 2,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                            .testTag("listen_create_room_btn")
+                    ) {
+                        if (isBusy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(Icons.Rounded.Headphones, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Buat Room & Dapatkan Kode", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            AnimatedVisibility(visible = actionTab == 1) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = joinCodeInput,
+                        onValueChange = onJoinCodeChange,
+                        label = { Text("Kode Sinkronisasi Room") },
+                        placeholder = { Text(joinPlaceholder) },
+                        leadingIcon = { Icon(Icons.Rounded.Tag, contentDescription = null) },
+                        singleLine = true,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("listen_join_code_input")
+                    )
+                    Button(
+                        onClick = onJoinRoom,
+                        enabled = !isBusy && username.trim().length >= 2 && joinCodeInput.length >= 4,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                            .testTag("listen_join_room_btn")
+                    ) {
+                        if (isBusy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(Icons.Rounded.Sync, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Gabung & Sinkronkan", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CloudUnavailableCard(
+    onSwitchToLocalWifi: () -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("listen_cloud_unavailable_card")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(22.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                modifier = Modifier.size(64.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Rounded.Cloud,
+                        contentDescription = "Mode Cloud",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            }
+            Text(
+                text = "Mode Cloud Belum Dikonfigurasi",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Build APK ini belum menyertakan konfigurasi Firebase (google-services.json). Untuk sinkronisasi tanpa login sekarang juga, gunakan Mode Wi-Fi / Hotspot Lokal.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Button(
+                onClick = onSwitchToLocalWifi,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .testTag("listen_switch_to_lan_btn")
+            ) {
+                Icon(Icons.Rounded.Wifi, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Gunakan Mode Wi-Fi / Hotspot", fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ListenTogetherCloudAuthCard(
+    firebaseAuth: FirebaseAuth,
+    credentialManager: CredentialManager?,
+    onAuthSuccess: () -> Unit,
+    onSwitchToLocalWifi: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isLoading by remember { mutableStateOf(false) }
+    var authError by remember { mutableStateOf<String?>(null) }
+
+    // Silent auto sign-in check for returning users (separate single-option request)
+    LaunchedEffect(firebaseAuth, credentialManager) {
+        if (credentialManager != null) {
+            attemptSilentGoogleSignIn(
+                context = context,
+                firebaseAuth = firebaseAuth,
+                credentialManager = credentialManager,
+                onAuthSuccess = onAuthSuccess
+            )
+        }
+    }
+
+    Card(
+        shape = RoundedCornerShape(26.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f)
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.30f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("listen_together_auth_gate")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
+                modifier = Modifier.size(72.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Rounded.Headphones,
+                        contentDescription = "Dengarkan Bersama Cloud",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
+            }
+
+            Text(
+                text = "Sinkronisasi Cloud Jarak Jauh",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Masuk dengan Google untuk membuat room jarak jauh lintas jaringan internet. Pemutar musik utama tetap bisa dipakai tanpa login.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+
+            authError?.let { err ->
+                Text(
+                    text = err,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            Button(
+                onClick = {
+                    if (credentialManager == null) {
+                        authError = "Layanan Google Sign-In tidak tersedia di perangkat ini. Gunakan Mode Wi-Fi / Hotspot."
+                        return@Button
+                    }
+                    isLoading = true
+                    authError = null
+                    launchInteractiveGoogleSignIn(
+                        context = context,
+                        firebaseAuth = firebaseAuth,
+                        credentialManager = credentialManager,
+                        scope = scope,
+                        onSuccess = {
+                            isLoading = false
+                            onAuthSuccess()
+                        },
+                        onCancelled = {
+                            isLoading = false
+                        },
+                        onError = { msg ->
+                            isLoading = false
+                            authError = msg
+                        }
+                    )
+                },
+                enabled = !isLoading,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+                    .testTag("listen_together_google_signin_btn")
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(Icons.Rounded.Login, contentDescription = null)
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        text = "Masuk dengan Google",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            OutlinedButton(
+                onClick = onSwitchToLocalWifi,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+            ) {
+                Icon(Icons.Rounded.Wifi, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Tanpa Login: Pakai Wi-Fi / Hotspot")
+            }
+        }
+    }
+}
+
+@Composable
 private fun ActiveRoomHeroCard(
     room: ListenRoom,
     isHost: Boolean,
+    isLocalLan: Boolean,
     onCopyCode: () -> Unit,
     onShareCode: () -> Unit
 ) {
@@ -904,14 +1114,16 @@ private fun ActiveRoomHeroCard(
                             modifier = Modifier.size(12.dp)
                         )
                         Spacer(Modifier.width(5.dp))
+                        val modeLabel = if (isLocalLan) "WI-FI" else "CLOUD"
                         Text(
-                            text = if (isHost) "LIVE • HOST" else "LIVE • SINKRON",
+                            text = if (isHost) "LIVE $modeLabel • HOST" else "LIVE $modeLabel • SINKRON",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onPrimary,
                             fontWeight = FontWeight.Bold
                         )
                     }
                 }
+                Spacer(Modifier.width(8.dp))
                 Text(
                     text = room.roomName,
                     style = MaterialTheme.typography.titleSmall,
@@ -933,7 +1145,7 @@ private fun ActiveRoomHeroCard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = "KODE SINKRONISASI",
                             style = MaterialTheme.typography.labelSmall,
@@ -941,9 +1153,11 @@ private fun ActiveRoomHeroCard(
                         )
                         Text(
                             text = room.roomCode,
-                            style = MaterialTheme.typography.headlineLarge.copy(letterSpacing = 4.sp),
+                            style = MaterialTheme.typography.headlineMedium.copy(letterSpacing = 3.sp),
                             fontWeight = FontWeight.ExtraBold,
                             color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.testTag("listen_active_room_code")
                         )
                     }
@@ -961,6 +1175,31 @@ private fun ActiveRoomHeroCard(
     }
 }
 
+private fun safeGetFirebaseAuth(context: Context): FirebaseAuth? {
+    return runCatching {
+        val appContext = context.applicationContext ?: context
+        if (FirebaseApp.getApps(appContext).isEmpty()) {
+            FirebaseApp.initializeApp(appContext)
+        }
+        if (FirebaseApp.getApps(appContext).isEmpty()) {
+            null
+        } else {
+            Firebase.auth
+        }
+    }.onFailure { err ->
+        Log.w("ListenTogether", "FirebaseApp unavailable on this APK build: ${err.message}")
+    }.getOrNull()
+}
+
+private fun Context.findActivity(): Activity? {
+    var current: Context? = this
+    while (current is ContextWrapper) {
+        if (current is Activity) return current
+        current = current.baseContext
+    }
+    return current as? Activity
+}
+
 private fun resolveDefaultWebClientId(context: Context): String? {
     val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
     if (resId == 0) return null
@@ -969,34 +1208,38 @@ private fun resolveDefaultWebClientId(context: Context): String? {
 
 private suspend fun attemptSilentGoogleSignIn(
     context: Context,
+    firebaseAuth: FirebaseAuth,
     credentialManager: CredentialManager,
     onAuthSuccess: () -> Unit
 ) {
-    if (Firebase.auth.currentUser != null) {
-        onAuthSuccess()
-        return
-    }
-    val clientId = resolveDefaultWebClientId(context) ?: return
-    val googleIdOption = GetGoogleIdOption.Builder()
-        .setFilterByAuthorizedAccounts(true)
-        .setServerClientId(clientId)
-        .setAutoSelectEnabled(true)
-        .build()
-    val request = GetCredentialRequest.Builder()
-        .addCredentialOption(googleIdOption)
-        .build()
     runCatching {
+        if (firebaseAuth.currentUser != null) {
+            onAuthSuccess()
+            return
+        }
+        val clientId = resolveDefaultWebClientId(context) ?: return
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(true)
+            .setServerClientId(clientId)
+            .setAutoSelectEnabled(true)
+            .build()
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
         val cred = credentialManager.getCredential(context, request).credential
         if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
             val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-            Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+            firebaseAuth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
             onAuthSuccess()
         }
+    }.onFailure { err ->
+        Log.d("Auth", "Silent Google Sign-In skipped: ${err.message}")
     }
 }
 
 private fun launchInteractiveGoogleSignIn(
     context: Context,
+    firebaseAuth: FirebaseAuth,
     credentialManager: CredentialManager,
     scope: CoroutineScope,
     onSuccess: () -> Unit,
@@ -1005,10 +1248,10 @@ private fun launchInteractiveGoogleSignIn(
 ) {
     val clientId = resolveDefaultWebClientId(context)
     if (clientId == null) {
-        onError("Konfigurasi Google Sign-In (google-services.json) belum tersedia pada build ini.")
+        onError("Konfigurasi Google Sign-In belum tersedia pada build ini. Gunakan Mode Wi-Fi / Hotspot.")
         return
     }
-    val activity = context as? Activity
+    val activity = context.findActivity()
     if (activity == null) {
         onError("Activity tidak tersedia untuk Google Sign-In.")
         return
@@ -1022,7 +1265,7 @@ private fun launchInteractiveGoogleSignIn(
             val cred = credentialManager.getCredential(activity, request).credential
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-                Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+                firebaseAuth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
                 onSuccess()
             } else {
                 onError("Tipe kredensial tidak dikenali.")
@@ -1030,9 +1273,9 @@ private fun launchInteractiveGoogleSignIn(
         } catch (e: GetCredentialCancellationException) {
             Log.w("Auth", "Google Sign-In cancelled or dismissed: ${e.message}", e)
             onCancelled()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e("Auth", "Google Sign-In failed", e)
-            onError(e.localizedMessage ?: "Gagal masuk dengan Google")
+            onError(e.localizedMessage ?: "Gagal masuk dengan Google. Coba Mode Wi-Fi / Hotspot.")
         }
     }
 }

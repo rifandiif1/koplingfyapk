@@ -3,6 +3,9 @@ package com.example.di
 import android.content.Context
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import com.example.R
 import com.example.data.local.db.KoplingfyDatabase
 import com.example.data.local.media.LocalMusicScanner
@@ -13,6 +16,8 @@ import com.example.data.providers.JamendoProvider
 import com.example.data.providers.MultiSourceRepository
 import com.example.data.providers.RadioBrowserProvider
 import com.example.data.providers.YouTubeMusicProvider
+import com.example.data.providers.youtube.YTPlayerUtils
+import com.example.data.providers.youtube.YouTubeCipherSolver
 import com.example.data.remote.ListenTogetherController
 import com.example.data.remote.ListenTogetherRepository
 import com.example.download.DownloadManagerRepository
@@ -103,11 +108,44 @@ class AppContainer(val context: Context) {
         tagOverrideDao = database.tagOverrideDao()
     )
 
+    val exoCacheDir = File(context.cacheDir, "koplingfy_exo_cache")
+
+    /**
+     * Singleton Media3 SimpleCache (200 MB LRU) modeled after Metrolist's MusicService `playerCache`.
+     * Enables instant replays, seamless seeking, and 512 KB chunked streaming from googlevideo.com.
+     */
+    val playerCache: SimpleCache by lazy {
+        SimpleCache(
+            exoCacheDir,
+            LeastRecentlyUsedCacheEvictor(200L * 1024L * 1024L),
+            StandaloneDatabaseProvider(context.applicationContext)
+        )
+    }
+
+    val youtubeCipherSolver = YouTubeCipherSolver(
+        context = context,
+        httpClient = httpClient
+    )
+
+    val ytPlayerUtils = YTPlayerUtils(
+        httpClient = httpClient,
+        cipherSolver = youtubeCipherSolver
+    )
+
     val audiusProvider = AudiusProvider(httpClient)
     val youtubeMusicProvider = YouTubeMusicProvider(
         httpClient = httpClient,
-        customInstanceProvider = { latestSettings.value.customPipedInstanceUrl }
+        customInstanceProvider = { latestSettings.value.customPipedInstanceUrl },
+        cipherSolver = youtubeCipherSolver,
+        ytPlayerUtils = ytPlayerUtils
     )
+
+    init {
+        // Silently pre-warm live YouTube player_ias sts & cipher config in background
+        appScope.launch {
+            runCatching { youtubeCipherSolver.ensurePlayerConfig() }
+        }
+    }
     val jamendoProvider = JamendoProvider(
         httpClient = httpClient,
         clientIdProvider = { latestSettings.value.jamendoClientId }
@@ -175,8 +213,14 @@ class AppContainer(val context: Context) {
     suspend fun clearCachesPreservingLibrary() {
         runCatching { httpClient.cache?.evictAll() }
         runCatching {
+            val keys = playerCache.keys.toList()
+            keys.forEach { key -> playerCache.removeResource(key) }
+        }
+        runCatching {
             context.cacheDir.listFiles()?.forEach { child ->
-                child.deleteRecursively()
+                if (child.name != exoCacheDir.name) {
+                    child.deleteRecursively()
+                }
             }
         }
         database.lyricsDao().clearLyricsCache()

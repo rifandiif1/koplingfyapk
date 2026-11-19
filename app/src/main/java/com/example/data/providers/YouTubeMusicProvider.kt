@@ -1,6 +1,10 @@
 package com.example.data.providers
 
 import android.util.Log
+import com.example.data.providers.youtube.MetrolistAudioQuality
+import com.example.data.providers.youtube.MetrolistPlaybackData
+import com.example.data.providers.youtube.YTPlayerUtils
+import com.example.data.providers.youtube.YouTubeCipherSolver
 import com.example.domain.model.AlbumItem
 import com.example.domain.model.ArtistItem
 import com.example.domain.model.MusicSource
@@ -32,20 +36,22 @@ import java.util.concurrent.TimeUnit
  *
  * Engineered for low-latency playback with parallel racing & pre-flight reachability probes:
  * - Catalog: Direct YouTube Music InnerTube WEB_REMIX API first, with Piped/Invidious fallback.
- * - Audio Stream Resolution (4 fast parallel tiers + 15-minute stream cache):
- *   Tier 0: Parallel race of InnerTube ANDROID_VR (direct M4A/Opus) + InnerTube IOS (native HLS + M4A)
- *   Tier 1: Parallel race of InnerTube IOS_MUSIC + ANDROID_MUSIC + TV_EMBEDDED
- *   Tier 2: Parallel race of top live Piped & Invidious instances (4.5s timeout cap — never hangs!)
- *   Tier 3: Parallel race of verified Invidious local audio proxies (/latest_version?local=true)
- *
- * Every candidate URL is pre-flight probed (Range: bytes=0-0) with its exact client User-Agent
- * before being handed to ExoPlayer, eliminating slow multi-tier player errors.
+ * - Audio Stream Resolution (Metrolist / Zemer Cipher 6-tier pipeline + 15-minute stream cache):
+ *   Tier 0: Direct InnerTube ANDROID_VR (1.65.10 & 1.71.26) + VISIONOS (zero-PO-token, instant)
+ *   Tier 1: Metrolist MAIN_CLIENT (WEB_REMIX) + TVHTML5_SIMPLY_EMBEDDED_PLAYER + TVHTML5
+ *           with live `signatureTimestamp` (`sts`), `cpn`, `signatureCipher`, and `n`-param solver
+ *   Tier 2: Native Apple HLS via InnerTube IOS & IOS_MUSIC
+ *   Tier 3: Secondary Android InnerTube clients (ANDROID_CREATOR, ANDROID_MUSIC, ANDROID_TESTSUITE)
+ *   Tier 4: Expanded live Piped API gateways
+ *   Tier 5: Expanded live Invidious API gateways (?local=true) & verified direct audio proxy
  *
  * Strictly streaming-only (isDownloadable = false).
  */
 class YouTubeMusicProvider(
     private val httpClient: OkHttpClient,
-    private val customInstanceProvider: () -> String
+    private val customInstanceProvider: () -> String,
+    private val cipherSolver: YouTubeCipherSolver = YouTubeCipherSolver(null, httpClient),
+    private val ytPlayerUtils: YTPlayerUtils = YTPlayerUtils(httpClient, cipherSolver)
 ) : MusicSourceProvider {
 
     override val source: MusicSource = MusicSource.YOUTUBE_MUSIC
@@ -285,8 +291,9 @@ class YouTubeMusicProvider(
         resolveStream(track, attempt = 0)?.url
 
     /**
-     * Fast parallel stream resolver with pre-flight verification & 15-minute cache.
-     * Never blocks sequentially on dead mirrors.
+     * Resolves a verified stream URL using `MetrolistGroup/Metrolist`'s `YTPlayerUtils` pipeline
+     * (Tiers 0–3: ANDROID_VR / VISIONOS / WEB_REMIX + Cipher / TVHTML5 + Cipher / IOS HLS / Android clients)
+     * with automatic Piped & Invidious federation failover (Tiers 4–5).
      */
     override suspend fun resolveStream(track: Track, attempt: Int): ResolvedStream? = withContext(Dispatchers.IO) {
         val videoId = track.sourceTrackId.takeIf { it.isNotBlank() }
@@ -295,43 +302,113 @@ class YouTubeMusicProvider(
 
         val now = System.currentTimeMillis()
         if (attempt == 0) {
+            ytPlayerUtils.getCachedPlayback(videoId)?.let { cached ->
+                return@withContext cached.toResolvedStream()
+            }
             val cached = streamCache[videoId]
             if (cached != null && cached.expiresAtMs > now) {
                 return@withContext cached.stream
             }
         } else {
-            // Invalidate stale cache if ExoPlayer reported an error and triggered a retry
+            // Invalidate stale cache when ExoPlayer reports a playback error and advances tier
+            ytPlayerUtils.invalidateCache(videoId)
             streamCache.remove(videoId)
         }
 
-        val tiers: List<suspend () -> ResolvedStream?> = listOf(
-            // Tier 0: Race VISIONOS + ANDROID_VR (1.65.10 & 1.71.26) — fastest zero-PO-token direct audio
-            { raceTier0PrimaryInnerTube(videoId) },
-            // Tier 1: Race IOS HLS + IOS_MUSIC HLS + IOS direct M4A (native Media3 HLS)
-            { raceTier1IosHlsInnerTube(videoId) },
-            // Tier 2: Race ANDROID_CREATOR + TV_EMBEDDED + ANDROID_MUSIC + ANDROID_TESTSUITE
-            { raceTier2SecondaryInnerTube(videoId) },
-            // Tier 3: Race expanded live Piped API gateways
-            { raceTier3PipedMirrors(videoId) },
-            // Tier 4: Race expanded live Invidious API gateways (local=true)
-            { raceTier4InvidiousMirrors(videoId) },
-            // Tier 5: Race verified Invidious direct audio proxy (/latest_version?local=true)
-            { raceTier5InvidiousProxy(videoId) }
-        )
+        // Tiers 0..3: Metrolist YTPlayerUtils (11 InnerTube clients + HEAD validateStatus + Cipher solver)
+        if (attempt <= 3) {
+            val metrolistData = runCatching {
+                ytPlayerUtils.playerResponseForPlayback(
+                    videoId = videoId,
+                    audioQuality = MetrolistAudioQuality.HIGH,
+                    startTier = attempt
+                )
+            }.getOrNull()
+            if (metrolistData != null && metrolistData.streamUrl.startsWith("http")) {
+                val resolved = metrolistData.toResolvedStream()
+                streamCache[videoId] = CachedStream(resolved, metrolistData.expiresAtMs)
+                return@withContext resolved
+            }
+        }
 
-        val startIdx = attempt.coerceIn(0, tiers.lastIndex)
-        for (tierIdx in startIdx until tiers.size) {
-            val resolved = runCatching { tiers[tierIdx]() }.getOrNull()
+        // Tiers 4..5: Federation failover (Piped & Invidious ?local=true + verified proxy)
+        val mirrorTiers: List<Pair<Int, suspend () -> ResolvedStream?>> = listOf(
+            4 to { raceTier4PipedMirrors(videoId) },
+            5 to { raceTier5InvidiousMirrorsAndProxy(videoId) }
+        )
+        for ((tierIdx, runner) in mirrorTiers) {
+            if (tierIdx < attempt) continue
+            val resolved = runCatching { runner() }.getOrNull()
             if (resolved != null && resolved.url.startsWith("http")) {
                 val tagged = resolved.copy(tierIndex = tierIdx)
-                Log.d("KoplingfyYouTube", "Resolved $videoId via tier=$tierIdx (${tagged.resolverName})")
+                Log.d("KoplingfyYouTube", "Resolved $videoId via mirror tier=$tierIdx (${tagged.resolverName})")
                 streamCache[videoId] = CachedStream(tagged, now + 15 * 60_000L)
                 return@withContext tagged
             }
         }
-        Log.w("KoplingfyYouTube", "All stream tiers exhausted for videoId=$videoId (startAttempt=$attempt)")
+        Log.w("KoplingfyYouTube", "All Metrolist + mirror stream tiers exhausted for videoId=$videoId (attempt=$attempt)")
         null
     }
+
+    /**
+     * Used directly by `KoplingfyPlaybackService`'s Metrolist `ResolvingDataSource` on ExoPlayer's IO thread.
+     * Hits the cached `MetrolistPlaybackData` / `streamCache` in 0ms on first play, and transparently
+     * refreshes expired YouTube URLs on long pauses or seeks.
+     */
+    suspend fun resolveForExoPlayer(videoId: String): MetrolistPlaybackData? = withContext(Dispatchers.IO) {
+        if (videoId.isBlank()) return@withContext null
+        val now = System.currentTimeMillis()
+
+        ytPlayerUtils.getCachedPlayback(videoId)?.let { return@withContext it }
+
+        val cached = streamCache[videoId]
+        if (cached != null && cached.expiresAtMs > now + 30_000L) {
+            return@withContext cached.stream.toPlaybackData(videoId, cached.expiresAtMs)
+        }
+
+        // Re-resolve fresh URL transparently (e.g. after a multi-hour pause when googlevideo URL expired)
+        val fresh = ytPlayerUtils.playerResponseForPlayback(
+            videoId = videoId,
+            audioQuality = MetrolistAudioQuality.HIGH,
+            startTier = 0
+        )
+        if (fresh != null) {
+            streamCache[videoId] = CachedStream(fresh.toResolvedStream(), fresh.expiresAtMs)
+            return@withContext fresh
+        }
+
+        val mirror = raceTier4PipedMirrors(videoId) ?: raceTier5InvidiousMirrorsAndProxy(videoId)
+        if (mirror != null) {
+            val exp = now + 15 * 60_000L
+            streamCache[videoId] = CachedStream(mirror, exp)
+            return@withContext mirror.toPlaybackData(videoId, exp)
+        }
+        null
+    }
+
+    private fun MetrolistPlaybackData.toResolvedStream(): ResolvedStream = ResolvedStream(
+        url = streamUrl,
+        userAgent = userAgent,
+        mimeType = mimeType,
+        resolverName = "Metrolist ${clientName}",
+        tierIndex = tierIndex
+    )
+
+    private fun ResolvedStream.toPlaybackData(videoId: String, expiresAtMs: Long): MetrolistPlaybackData =
+        MetrolistPlaybackData(
+            videoId = videoId,
+            streamUrl = url,
+            mimeType = mimeType ?: "audio/mp4",
+            userAgent = userAgent ?: webRemixUa,
+            contentLength = -1L,
+            bitrate = 128_000,
+            itag = 0,
+            loudnessDb = null,
+            expiresAtMs = expiresAtMs,
+            clientName = resolverName,
+            isHls = mimeType == "application/x-mpegURL" || url.contains("m3u8", ignoreCase = true),
+            tierIndex = tierIndex
+        )
 
     override suspend fun getRelatedTracks(track: Track, limit: Int): List<Track> = withContext(Dispatchers.IO) {
         val videoId = track.sourceTrackId.takeIf { it.length == 11 }
@@ -525,7 +602,7 @@ class YouTubeMusicProvider(
     }
 
     private suspend fun raceTier0PrimaryInnerTube(videoId: String): ResolvedStream? {
-        // VISIONOS & ANDROID_VR do not require visitorData — launch immediately with zero pre-delay!
+        // VISIONOS & ANDROID_VR do not require visitorData or cipher — launch immediately!
         return raceFirstValid(
             timeoutMs = 10_000L,
             tasks = listOf(
@@ -536,7 +613,26 @@ class YouTubeMusicProvider(
         )
     }
 
-    private suspend fun raceTier1IosHlsInnerTube(videoId: String): ResolvedStream? {
+    /**
+     * Metrolist `YTPlayerUtils` core pipeline:
+     * Fetches live `signatureTimestamp` (`sts`) from YouTube's active `player_ias` script,
+     * queries `WEB_REMIX` (`music.youtube.com/youtubei/v1/player`), `TVHTML5_SIMPLY_EMBEDDED_PLAYER`,
+     * and `TVHTML5` in parallel, and solves `signatureCipher` + `n`-param via `YouTubeCipherSolver`.
+     */
+    private suspend fun raceTier1MetrolistCipherClients(videoId: String): ResolvedStream? {
+        val vd = getVisitorDataQuick()
+        val sts = withTimeoutOrNull(4_500L) { cipherSolver.getSignatureTimestamp() }
+        return raceFirstValid(
+            timeoutMs = 14_000L,
+            tasks = listOf(
+                { resolveViaInnerTubeWebRemix(videoId, vd, sts) },
+                { resolveViaInnerTubeTvEmbedded(videoId, vd, sts) },
+                { resolveViaInnerTubeTvHtml5(videoId, vd, sts) }
+            )
+        )
+    }
+
+    private suspend fun raceTier2IosHlsInnerTube(videoId: String): ResolvedStream? {
         val vd = getVisitorDataQuick()
         return raceFirstValid(
             timeoutMs = 10_000L,
@@ -548,20 +644,19 @@ class YouTubeMusicProvider(
         )
     }
 
-    private suspend fun raceTier2SecondaryInnerTube(videoId: String): ResolvedStream? {
+    private suspend fun raceTier3SecondaryAndroidClients(videoId: String): ResolvedStream? {
         val vd = getVisitorDataQuick()
         return raceFirstValid(
             timeoutMs = 10_000L,
             tasks = listOf(
                 { resolveViaInnerTubeAndroidCreator(videoId, vd) },
-                { resolveViaInnerTubeTvEmbedded(videoId, vd) },
                 { resolveViaInnerTubeAndroidMusic(videoId, vd) },
                 { resolveViaInnerTubeAndroidTestSuite(videoId, vd) }
             )
         )
     }
 
-    private suspend fun raceTier3PipedMirrors(videoId: String): ResolvedStream? {
+    private suspend fun raceTier4PipedMirrors(videoId: String): ResolvedStream? {
         if (dynamicPipedInstances.isEmpty()) {
             withTimeoutOrNull(2_500L) { refreshPublicInstancesFast() }
         }
@@ -571,19 +666,18 @@ class YouTubeMusicProvider(
         return raceFirstValid(timeoutMs = 10_000L, tasks = tasks)
     }
 
-    private suspend fun raceTier4InvidiousMirrors(videoId: String): ResolvedStream? {
+    private suspend fun raceTier5InvidiousMirrorsAndProxy(videoId: String): ResolvedStream? {
         if (dynamicInvidiousInstances.isEmpty()) {
             withTimeoutOrNull(2_500L) { refreshPublicInstancesFast() }
         }
-        val tasks = invidiousCandidates().take(8).map<String, suspend () -> ResolvedStream?> { base ->
+        val apiTasks = invidiousCandidates().take(8).map<String, suspend () -> ResolvedStream?> { base ->
             { resolveSingleInvidiousInstance(base, videoId) }
         }
-        return raceFirstValid(timeoutMs = 10_000L, tasks = tasks)
-    }
+        val apiWinner = raceFirstValid(timeoutMs = 9_000L, tasks = apiTasks)
+        if (apiWinner != null) return apiWinner
 
-    private suspend fun raceTier5InvidiousProxy(videoId: String): ResolvedStream? {
         val hosts = invidiousCandidates().take(6)
-        val tasks = hosts.flatMap { base ->
+        val proxyTasks = hosts.flatMap { base ->
             listOf<suspend () -> ResolvedStream?>(
                 {
                     val proxyUrl = "$base/latest_version?id=$videoId&itag=140&local=true"
@@ -609,7 +703,7 @@ class YouTubeMusicProvider(
                 }
             )
         }
-        return raceFirstValid(timeoutMs = 9_000L, tasks = tasks)
+        return raceFirstValid(timeoutMs = 8_500L, tasks = proxyTasks)
     }
 
     /**
@@ -908,11 +1002,66 @@ class YouTubeMusicProvider(
         )
     }
 
-    private fun resolveViaInnerTubeTvEmbedded(videoId: String, visitorData: String?): ResolvedStream? {
+    private suspend fun resolveViaInnerTubeWebRemix(
+        videoId: String,
+        visitorData: String?,
+        signatureTimestamp: Int?
+    ): ResolvedStream? {
+        val cpn = YouTubeCipherSolver.generateCpn()
         val payload = JSONObject().apply {
             put("videoId", videoId)
+            put("cpn", cpn)
             put("contentCheckOk", true)
             put("racyCheckOk", true)
+            if (signatureTimestamp != null) {
+                put("playbackContext", JSONObject().apply {
+                    put("contentPlaybackContext", JSONObject().apply {
+                        put("signatureTimestamp", signatureTimestamp)
+                    })
+                })
+            }
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", "1.20250310.01.00")
+                    put("hl", "en")
+                    put("gl", deviceRegion)
+                    if (!visitorData.isNullOrBlank()) put("visitorData", visitorData)
+                })
+            })
+        }
+        return postInnerTubePlayerCipherAware(
+            endpoint = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false",
+            payload = payload,
+            userAgent = webRemixUa,
+            clientNameHeader = "67",
+            clientVersionHeader = "1.20250310.01.00",
+            visitorData = visitorData,
+            originUrl = "https://music.youtube.com",
+            cpn = cpn,
+            preferHls = false,
+            resolverName = "InnerTube WEB_REMIX (Cipher)"
+        )
+    }
+
+    private suspend fun resolveViaInnerTubeTvEmbedded(
+        videoId: String,
+        visitorData: String?,
+        signatureTimestamp: Int?
+    ): ResolvedStream? {
+        val cpn = YouTubeCipherSolver.generateCpn()
+        val payload = JSONObject().apply {
+            put("videoId", videoId)
+            put("cpn", cpn)
+            put("contentCheckOk", true)
+            put("racyCheckOk", true)
+            if (signatureTimestamp != null) {
+                put("playbackContext", JSONObject().apply {
+                    put("contentPlaybackContext", JSONObject().apply {
+                        put("signatureTimestamp", signatureTimestamp)
+                    })
+                })
+            }
             put("context", JSONObject().apply {
                 put("client", JSONObject().apply {
                     put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
@@ -926,24 +1075,227 @@ class YouTubeMusicProvider(
                 })
             })
         }
-        return postInnerTubePlayerDirect(
+        return postInnerTubePlayerCipherAware(
             endpoint = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
             payload = payload,
             userAgent = webRemixUa,
             clientNameHeader = "85",
             clientVersionHeader = "2.0",
             visitorData = visitorData,
-            isWebClient = true,
+            originUrl = "https://www.youtube.com",
+            cpn = cpn,
             preferHls = false,
-            resolverName = "InnerTube TV_EMBEDDED"
+            resolverName = "InnerTube TV_EMBEDDED (Cipher)"
+        )
+    }
+
+    private suspend fun resolveViaInnerTubeTvHtml5(
+        videoId: String,
+        visitorData: String?,
+        signatureTimestamp: Int?
+    ): ResolvedStream? {
+        val cpn = YouTubeCipherSolver.generateCpn()
+        val payload = JSONObject().apply {
+            put("videoId", videoId)
+            put("cpn", cpn)
+            put("contentCheckOk", true)
+            put("racyCheckOk", true)
+            if (signatureTimestamp != null) {
+                put("playbackContext", JSONObject().apply {
+                    put("contentPlaybackContext", JSONObject().apply {
+                        put("signatureTimestamp", signatureTimestamp)
+                    })
+                })
+            }
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "TVHTML5")
+                    put("clientVersion", "7.20250312.16.00")
+                    put("hl", "en")
+                    put("gl", deviceRegion)
+                    if (!visitorData.isNullOrBlank()) put("visitorData", visitorData)
+                })
+            })
+        }
+        return postInnerTubePlayerCipherAware(
+            endpoint = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+            payload = payload,
+            userAgent = webRemixUa,
+            clientNameHeader = "7",
+            clientVersionHeader = "7.20250312.16.00",
+            visitorData = visitorData,
+            originUrl = "https://www.youtube.com",
+            cpn = cpn,
+            preferHls = false,
+            resolverName = "InnerTube TVHTML5 (Cipher)"
         )
     }
 
     /**
+     * Metrolist / Zemer-Cipher aware InnerTube `/player` request:
+     * Handles both direct `url` and `signatureCipher` (`s`/`sp`/`url`) audio formats,
+     * solves `sig` and `n`-param via `YouTubeCipherSolver`, and appends `cpn`.
+     */
+    private suspend fun postInnerTubePlayerCipherAware(
+        endpoint: String,
+        payload: JSONObject,
+        userAgent: String,
+        clientNameHeader: String,
+        clientVersionHeader: String,
+        visitorData: String?,
+        originUrl: String,
+        cpn: String,
+        preferHls: Boolean,
+        resolverName: String
+    ): ResolvedStream? {
+        val root = runCatching {
+            val reqBuilder = Request.Builder()
+                .url(endpoint)
+                .header("User-Agent", userAgent)
+                .header("X-YouTube-Client-Name", clientNameHeader)
+                .header("X-YouTube-Client-Version", clientVersionHeader)
+                .header("X-Goog-Api-Format-Version", "2")
+                .header("Origin", originUrl)
+                .header("Referer", "$originUrl/")
+                .header("Accept", "application/json")
+                .post(payload.toString().toRequestBody(jsonMediaType))
+
+            if (!visitorData.isNullOrBlank()) {
+                reqBuilder.header("X-Goog-Visitor-Id", visitorData)
+            }
+
+            fastClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                if (body.startsWith("{")) JSONObject(body) else null
+            }
+        }.getOrNull() ?: return null
+
+        val status = root.optJSONObject("playabilityStatus")?.optString("status")
+        if (status != null && status != "OK" && status != "LIVE_STREAM_OFFLINE") {
+            return null
+        }
+        val streamingData = root.optJSONObject("streamingData") ?: return null
+        val hls = streamingData.optString("hlsManifestUrl")
+
+        if (preferHls && hls.startsWith("http")) {
+            return ResolvedStream(
+                url = hls,
+                userAgent = userAgent,
+                mimeType = "application/x-mpegURL",
+                resolverName = "$resolverName (HLS)"
+            )
+        }
+
+        // Rank adaptive audio formats (both direct `url` AND `signatureCipher` / `cipher`)
+        val rankedAudio = rankAudioFormatsIncludingCipher(streamingData.optJSONArray("adaptiveFormats"))
+        for (entry in rankedAudio) {
+            val finalUrl = cipherSolver.resolveStreamUrl(
+                directUrl = entry.directUrl,
+                signatureCipher = entry.signatureCipher,
+                cpn = cpn,
+                solveNParam = true
+            )
+            if (finalUrl != null && finalUrl.startsWith("http")) {
+                return ResolvedStream(
+                    url = finalUrl,
+                    userAgent = userAgent,
+                    mimeType = entry.mimeType,
+                    resolverName = resolverName
+                )
+            }
+        }
+
+        // Fallback to muxed formats (also cipher-aware)
+        val rankedMuxed = rankMuxedFormatsIncludingCipher(streamingData.optJSONArray("formats"))
+        for (entry in rankedMuxed) {
+            val finalUrl = cipherSolver.resolveStreamUrl(
+                directUrl = entry.directUrl,
+                signatureCipher = entry.signatureCipher,
+                cpn = cpn,
+                solveNParam = true
+            )
+            if (finalUrl != null && finalUrl.startsWith("http")) {
+                return ResolvedStream(
+                    url = finalUrl,
+                    userAgent = userAgent,
+                    mimeType = entry.mimeType,
+                    resolverName = "$resolverName (Muxed)"
+                )
+            }
+        }
+
+        if (hls.startsWith("http")) {
+            return ResolvedStream(
+                url = hls,
+                userAgent = userAgent,
+                mimeType = "application/x-mpegURL",
+                resolverName = "$resolverName (HLS)"
+            )
+        }
+        return null
+    }
+
+    private data class FormatCandidate(
+        val directUrl: String?,
+        val signatureCipher: String?,
+        val mimeType: String,
+        val score: Int
+    )
+
+    private fun rankAudioFormatsIncludingCipher(formats: JSONArray?): List<FormatCandidate> {
+        if (formats == null || formats.length() == 0) return emptyList()
+        val list = mutableListOf<FormatCandidate>()
+        for (i in 0 until formats.length()) {
+            val obj = formats.optJSONObject(i) ?: continue
+            if (obj.has("drmFamilies")) continue
+            val mime = obj.optString("mimeType").lowercase()
+            if (!mime.startsWith("audio/")) continue
+            val direct = obj.optString("url").takeIf { it.startsWith("http") }
+            val cipher = obj.optString("signatureCipher").ifBlank { obj.optString("cipher") }
+                .takeIf { it.isNotBlank() }
+            if (direct == null && cipher == null) continue
+
+            val bitrate = obj.optInt("bitrate", obj.optInt("averageBitrate", 0))
+            val codecBonus = when {
+                mime.contains("mp4") || mime.contains("mp4a") -> 200_000
+                mime.contains("opus") || mime.contains("webm") -> 150_000
+                else -> 0
+            }
+            val directBonus = if (direct != null) 50_000 else 0
+            list.add(
+                FormatCandidate(
+                    directUrl = direct,
+                    signatureCipher = cipher,
+                    mimeType = mime.substringBefore(";"),
+                    score = bitrate + codecBonus + directBonus
+                )
+            )
+        }
+        return list.sortedByDescending { it.score }
+    }
+
+    private fun rankMuxedFormatsIncludingCipher(formats: JSONArray?): List<FormatCandidate> {
+        if (formats == null || formats.length() == 0) return emptyList()
+        val list = mutableListOf<FormatCandidate>()
+        for (i in 0 until formats.length()) {
+            val obj = formats.optJSONObject(i) ?: continue
+            if (obj.has("drmFamilies")) continue
+            val direct = obj.optString("url").takeIf { it.startsWith("http") }
+            val cipher = obj.optString("signatureCipher").ifBlank { obj.optString("cipher") }
+                .takeIf { it.isNotBlank() }
+            if (direct == null && cipher == null) continue
+            val mime = obj.optString("mimeType").substringBefore(";").ifBlank { "video/mp4" }
+            val bitrate = obj.optInt("bitrate", 0)
+            list.add(FormatCandidate(direct, cipher, mime, bitrate))
+        }
+        return list.sortedByDescending { it.score }
+    }
+
+    /**
      * Posts to YouTube InnerTube `/player` and immediately returns the best playable stream URL
-     * without destructive `Range: bytes=0-0` pre-flight probes (which falsely reject HLS manifests
-     * and add unnecessary latency on mobile networks). If ExoPlayer encounters a 403 on playback,
-     * PlaybackController automatically advances to the next tier.
+     * (appending `cpn`) without destructive `Range: bytes=0-0` pre-flight probes. If ExoPlayer
+     * encounters a 403 on playback, PlaybackController automatically advances to the next tier.
      */
     private fun postInnerTubePlayerDirect(
         endpoint: String,
@@ -956,6 +1308,8 @@ class YouTubeMusicProvider(
         preferHls: Boolean,
         resolverName: String
     ): ResolvedStream? {
+        val cpn = YouTubeCipherSolver.generateCpn()
+        if (!payload.has("cpn")) payload.put("cpn", cpn)
         return runCatching {
             val reqBuilder = Request.Builder()
                 .url(endpoint)
@@ -979,12 +1333,17 @@ class YouTubeMusicProvider(
                 val body = resp.body?.string().orEmpty()
                 if (!body.startsWith("{")) return@use null
                 val root = JSONObject(body)
-                extractCandidateFromPlayerJson(
+                val cand = extractCandidateFromPlayerJson(
                     root = root,
                     userAgent = userAgent,
                     preferHls = preferHls,
                     resolverName = resolverName
-                )
+                ) ?: return@use null
+                val finalUrl = if (cand.mimeType != "application/x-mpegURL" && !cand.url.contains("cpn=")) {
+                    val sep = if (cand.url.contains("?")) "&" else "?"
+                    "${cand.url}${sep}cpn=$cpn"
+                } else cand.url
+                cand.copy(url = finalUrl)
             }
         }.getOrNull()
     }
