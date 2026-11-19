@@ -16,24 +16,34 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Set up JDK 17
+      - name: 2. Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: 3. Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: 4. Set up Gradle & Restore Cache
+      - name: 4. Set up Gradle 9.3.1 & Restore Cache
         uses: gradle/actions/setup-gradle@v4
         with:
+          gradle-version: '9.3.1'
           cache-read-only: false
 
-      - name: 5. Prepare Optional .env for Secrets Plugin
+      - name: 5. Prepare Environment & Debug Keystore
         run: |
-          if [ ! -f .env ]; then
+          if [ ! -f .env ] && [ -f .env.example ]; then
             cp .env.example .env
+          fi
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: 6. Validate Project Tasks
@@ -45,16 +55,22 @@ jobs:
       - name: 8. Build Debug APK
         run: gradle :app:assembleDebug --no-daemon
 
-      - name: 9. Decode Signing Keystore & Build Release APK (If Secrets Configured)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+      - name: 9. Build Signed Release APK (If Secrets Configured)
+        id: build_release
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
-          export KEYSTORE_PATH="${PWD}/my-upload-key.jks"
-          gradle :app:assembleRelease --no-daemon
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
+            export KEYSTORE_PATH="${PWD}/my-upload-key.jks"
+            gradle :app:assembleRelease --no-daemon
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release signing secrets not configured; skipping release APK build."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 10. Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -64,7 +80,7 @@ jobs:
           if-no-files-found: error
 
       - name: 11. Upload Release APK Artifact (If Built)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        if: steps.build_release.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: koplingfy-release-apk
