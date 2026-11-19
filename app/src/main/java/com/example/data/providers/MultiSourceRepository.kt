@@ -2,11 +2,8 @@ package com.example.data.providers
 
 import com.example.data.local.db.TrackDao
 import com.example.data.local.prefs.AppSettings
-import com.example.domain.model.AlbumItem
-import com.example.domain.model.ArtistItem
 import com.example.domain.model.GlobalSearchResult
 import com.example.domain.model.MusicSource
-import com.example.domain.model.PlaylistSummary
 import com.example.domain.model.ProviderHealthState
 import com.example.domain.model.ProviderStatus
 import com.example.domain.model.RadioStation
@@ -181,18 +178,26 @@ class MultiSourceRepository(
     }
 
     /**
-     * Resolves a playable URL for any track, with automatic cross-provider fallback if the primary fails.
+     * Resolves a playable stream (URL + matching client User-Agent & MIME type) for any track,
+     * supporting multi-attempt tier fallback and cross-provider failover.
      */
-    suspend fun resolvePlayableUrl(track: Track, settings: AppSettings): String? {
-        // Offline local or downloaded copy always wins!
-        if (!track.localPath.isNullOrBlank()) return track.localPath
-        if (track.source == MusicSource.RADIO) return track.streamUrl
+    suspend fun resolvePlayableStream(
+        track: Track,
+        settings: AppSettings,
+        attempt: Int = 0
+    ): ResolvedStream? {
+        if (!track.localPath.isNullOrBlank()) {
+            return ResolvedStream(url = track.localPath, resolverName = "Offline Local")
+        }
+        if (track.source == MusicSource.RADIO) {
+            return track.streamUrl?.let { ResolvedStream(url = it, resolverName = "Internet Radio") }
+        }
 
         val primary = onlineProviders[track.source]
-        val resolved = runCatching { primary?.resolveStreamUrl(track) }.getOrNull()
-        if (!resolved.isNullOrBlank()) return resolved
+        val resolved = runCatching { primary?.resolveStream(track, attempt) }.getOrNull()
+        if (resolved != null && resolved.url.isNotBlank()) return resolved
 
-        // Automatic fallback: search enabled alternate online providers for matching track
+        // Automatic cross-provider fallback if primary source failed
         val fallbacks = settings.sourcePriorityOrder.filter {
             it != track.source && it in settings.enabledSources && it in onlineProviders
         }
@@ -206,11 +211,11 @@ class MultiSourceRepository(
                 TrackMetadataNormalizer.normalizeTitle(it.title) == normTitle
             } ?: candidates.firstOrNull()
             if (match != null) {
-                val url = runCatching { provider.resolveStreamUrl(match) }.getOrNull()
-                if (!url.isNullOrBlank()) return url
+                val stream = runCatching { provider.resolveStream(match, 0) }.getOrNull()
+                if (stream != null && stream.url.isNotBlank()) return stream
             }
         }
-        return track.streamUrl
+        return track.streamUrl?.let { ResolvedStream(url = it, resolverName = track.source.displayName) }
     }
 
     suspend fun getRelatedTracks(track: Track): List<Track> {

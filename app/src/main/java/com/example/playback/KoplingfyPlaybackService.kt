@@ -82,8 +82,7 @@ class KoplingfyPlaybackService : MediaLibraryService() {
             }
         }.setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
 
-        val okHttpFactory = OkHttpDataSource.Factory(container.httpClient)
-            .setUserAgent("Koplingfy/1.0.0 (Android; Media3)")
+        val okHttpFactory = OkHttpDataSource.Factory(container.mediaHttpClient)
         val dataSourceFactory = DefaultDataSource.Factory(this, okHttpFactory)
 
         val loadControl = DefaultLoadControl.Builder()

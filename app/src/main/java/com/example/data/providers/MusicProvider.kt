@@ -8,6 +8,14 @@ import com.example.domain.model.ProviderStatus
 import com.example.domain.model.Track
 import kotlin.math.abs
 
+data class ResolvedStream(
+    val url: String,
+    val userAgent: String? = null,
+    val mimeType: String? = null,
+    val resolverName: String = "",
+    val tierIndex: Int = 0
+)
+
 interface MusicSourceProvider {
     val source: MusicSource
     suspend fun checkHealth(): ProviderStatus
@@ -19,6 +27,8 @@ interface MusicSourceProvider {
     suspend fun searchPlaylists(query: String, limit: Int = 10): List<PlaylistSummary> = emptyList()
     suspend fun getRelatedTracks(track: Track, limit: Int = 12): List<Track> = emptyList()
     suspend fun resolveStreamUrl(track: Track): String? = track.streamUrl
+    suspend fun resolveStream(track: Track, attempt: Int = 0): ResolvedStream? =
+        resolveStreamUrl(track)?.let { ResolvedStream(url = it, resolverName = source.displayName) }
 }
 
 object TrackMetadataNormalizer {

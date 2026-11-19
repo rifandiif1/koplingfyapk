@@ -17,11 +17,13 @@ import com.example.data.local.db.TrackDao
 import com.example.data.local.db.TrackEntity
 import com.example.data.local.prefs.SettingsDataStore
 import com.example.data.providers.MultiSourceRepository
+import com.example.data.providers.ResolvedStream
 import com.example.domain.model.RepeatModeState
 import com.example.domain.model.Track
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicReference
 
 data class PlaybackUiState(
     val currentTrack: Track? = null,
@@ -50,7 +53,8 @@ class PlaybackController(
     private val multiSourceRepository: MultiSourceRepository,
     private val trackDao: TrackDao,
     private val historyDao: HistoryDao,
-    private val settingsDataStore: SettingsDataStore
+    private val settingsDataStore: SettingsDataStore,
+    private val activeStreamUserAgent: AtomicReference<String>
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -60,7 +64,9 @@ class PlaybackController(
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var mediaController: MediaController? = null
     private var pendingTrackToPlay: Pair<Track, List<Track>>? = null
-    private val shuffledIndices = mutableListOf<Int>()
+    private var resolveJob: Job? = null
+    private var currentStreamAttempt = 0
+    private val maxStreamAttempts = 6
 
     init {
         connectToService()
@@ -97,7 +103,6 @@ class PlaybackController(
                 repeatMode = settings.defaultRepeat,
                 playbackSpeed = settings.playbackSpeed
             )
-            // Restore last track metadata if resume is enabled and nothing playing yet
             if (settings.resumeOnStartup && settings.lastTrackId.isNotBlank() && _state.value.currentTrack == null) {
                 val last = trackDao.getTrackById(settings.lastTrackId)?.toDomain()
                 if (last != null) {
@@ -117,6 +122,9 @@ class PlaybackController(
         controller.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _state.value = _state.value.copy(isPlaying = isPlaying)
+                if (isPlaying) {
+                    _state.value = _state.value.copy(errorMessage = null)
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -130,19 +138,35 @@ class PlaybackController(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                _state.value = _state.value.copy(
-                    isBuffering = false,
-                    isPlaying = false,
-                    errorMessage = "Playback recovery: ${error.localizedMessage ?: "Stream error"}"
-                )
-                // Attempt automatic recovery via fallback provider
                 val cur = _state.value.currentTrack ?: return
-                scope.launch {
-                    val settings = settingsDataStore.settingsFlow.first()
-                    val retryUrl = multiSourceRepository.resolvePlayableUrl(cur, settings)
-                    if (!retryUrl.isNullOrBlank()) {
-                        prepareAndStartSingle(controller, cur, retryUrl, autoPlay = true)
+                if (currentStreamAttempt < maxStreamAttempts) {
+                    val nextAttempt = currentStreamAttempt
+                    currentStreamAttempt = nextAttempt + 1
+                    _state.value = _state.value.copy(
+                        isBuffering = true,
+                        errorMessage = "Switching stream mirror (tier ${nextAttempt + 1})..."
+                    )
+                    resolveJob?.cancel()
+                    resolveJob = scope.launch {
+                        val settings = settingsDataStore.settingsFlow.first()
+                        val retryStream = multiSourceRepository.resolvePlayableStream(cur, settings, nextAttempt)
+                        if (retryStream != null) {
+                            currentStreamAttempt = maxOf(currentStreamAttempt, retryStream.tierIndex + 1)
+                            prepareAndStartSingle(controller, cur, retryStream, autoPlay = true)
+                        } else {
+                            _state.value = _state.value.copy(
+                                isBuffering = false,
+                                isPlaying = false,
+                                errorMessage = "Stream error: ${error.localizedMessage ?: "All mirrors exhausted"}"
+                            )
+                        }
                     }
+                } else {
+                    _state.value = _state.value.copy(
+                        isBuffering = false,
+                        isPlaying = false,
+                        errorMessage = "Playback error: ${error.localizedMessage ?: "Unable to stream track"}"
+                    )
                 }
             }
         })
@@ -176,6 +200,7 @@ class PlaybackController(
             connectToService()
             return
         }
+        currentStreamAttempt = 0
         val normalizedQueue = if (queue.any { it.id == track.id }) queue else listOf(track) + queue
         val idx = normalizedQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
 
@@ -189,8 +214,8 @@ class PlaybackController(
             errorMessage = null
         )
 
-        scope.launch {
-            // Persist track metadata & playback history in Room
+        resolveJob?.cancel()
+        resolveJob = scope.launch {
             val existing = trackDao.getTrackById(track.id)
             val merged = track.copy(
                 isFavorite = existing?.isFavorite ?: track.isFavorite,
@@ -203,8 +228,8 @@ class PlaybackController(
             _state.value = _state.value.copy(currentTrack = merged)
 
             val settings = settingsDataStore.settingsFlow.first()
-            val playableUrl = multiSourceRepository.resolvePlayableUrl(merged, settings)
-            if (playableUrl.isNullOrBlank()) {
+            val stream = multiSourceRepository.resolvePlayableStream(merged, settings, attempt = 0)
+            if (stream == null || stream.url.isBlank()) {
                 _state.value = _state.value.copy(
                     isBuffering = false,
                     isPlaying = false,
@@ -212,16 +237,21 @@ class PlaybackController(
                 )
                 return@launch
             }
-            prepareAndStartSingle(controller, merged, playableUrl, autoPlay = true)
+            currentStreamAttempt = stream.tierIndex + 1
+            prepareAndStartSingle(controller, merged, stream, autoPlay = true)
         }
     }
 
     private fun prepareAndStartSingle(
         controller: MediaController,
         track: Track,
-        playableUrl: String,
+        stream: ResolvedStream,
         autoPlay: Boolean
     ) {
+        activeStreamUserAgent.set(
+            stream.userAgent?.takeIf { it.isNotBlank() } ?: "Koplingfy/1.0.0 (Android; Media3)"
+        )
+
         val metadata = MediaMetadata.Builder()
             .setTitle(track.title)
             .setArtist(track.artist)
@@ -233,13 +263,18 @@ class PlaybackController(
             }
             .build()
 
-        val mediaItem = MediaItem.Builder()
+        val itemBuilder = MediaItem.Builder()
             .setMediaId(track.id)
-            .setUri(Uri.parse(playableUrl))
+            .setUri(Uri.parse(stream.url))
             .setMediaMetadata(metadata)
-            .build()
 
-        controller.setMediaItem(mediaItem)
+        // Only force explicit MIME type for adaptive manifests (HLS/DASH); let Media3 auto-sniff progressive audio
+        val mime = stream.mimeType
+        if (mime == "application/x-mpegURL" || mime == "application/dash+xml") {
+            itemBuilder.setMimeType(mime)
+        }
+
+        controller.setMediaItem(itemBuilder.build())
         controller.prepare()
         if (autoPlay) controller.play()
     }
@@ -331,8 +366,7 @@ class PlaybackController(
             playTrack(track, listOf(track))
             return
         }
-        val updated = cur.queue + track
-        _state.value = cur.copy(queue = updated)
+        _state.value = cur.copy(queue = cur.queue + track)
     }
 
     fun playNext(track: Track) {

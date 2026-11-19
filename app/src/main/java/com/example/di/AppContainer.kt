@@ -27,6 +27,7 @@ import okhttp3.Cache
 import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(UnstableApi::class)
 class AppContainer(val context: Context) {
@@ -35,6 +36,12 @@ class AppContainer(val context: Context) {
 
     val settingsDataStore = SettingsDataStore(context)
     private val latestSettings = MutableStateFlow(AppSettings())
+
+    /**
+     * Thread-safe User-Agent reference used by ExoPlayer's OkHttpDataSource so direct
+     * YouTube InnerTube googlevideo.com streams send the exact matching client User-Agent.
+     */
+    val activeStreamUserAgent = AtomicReference("Koplingfy/1.0.0 (Android; Media3)")
 
     init {
         appScope.launch {
@@ -52,8 +59,26 @@ class AppContainer(val context: Context) {
         .followRedirects(true)
         .followSslRedirects(true)
         .addInterceptor { chain ->
+            val original = chain.request()
+            // Preserve custom User-Agent set by InnerTube/LRCLIB calls; apply default otherwise
+            val req = if (original.header("User-Agent") == null) {
+                original.newBuilder()
+                    .header("User-Agent", "Koplingfy/1.0.0 (Android; MusicPlayer)")
+                    .build()
+            } else original
+            chain.proceed(req)
+        }
+        .build()
+
+    val mediaHttpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .addInterceptor { chain ->
+            val ua = activeStreamUserAgent.get().orEmpty().ifBlank { "Koplingfy/1.0.0 (Android; Media3)" }
             val req = chain.request().newBuilder()
-                .header("User-Agent", "Koplingfy/1.0.0 (Android; MusicPlayer)")
+                .header("User-Agent", ua)
                 .build()
             chain.proceed(req)
         }
@@ -106,7 +131,8 @@ class AppContainer(val context: Context) {
         multiSourceRepository = multiSourceRepository,
         trackDao = database.trackDao(),
         historyDao = database.historyDao(),
-        settingsDataStore = settingsDataStore
+        settingsDataStore = settingsDataStore,
+        activeStreamUserAgent = activeStreamUserAgent
     )
 
     val downloadManagerRepository = DownloadManagerRepository(

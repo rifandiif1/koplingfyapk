@@ -10,8 +10,15 @@ All music providers implement `com.example.data.providers.MusicSourceProvider` s
 - **Offline Downloads:** Permitted strictly when the artist sets `is_downloadable = true`.
 
 ### 2. YouTube Music (`YouTubeMusicProvider`)
-- **Free Access Strategy:** Uses open-source **Piped API** federation (`/search?filter=music_songs|music_artists|music_albums|music_playlists`, `/trending`, `/streams/{videoId}`) with automatic failover across multiple public Piped nodes and **Invidious API** (`/api/v1/search`, `/api/v1/trending`, `/api/v1/videos/{videoId}`).
-- **Fresh Stream Resolution:** Audio-only M4A/Opus URLs are resolved fresh at playback time so signed stream URLs do not expire in long queues.
+- **Free Access Strategy (Zero Paid API Key):** Queries YouTube Music **InnerTube `WEB_REMIX`** directly from the user's device for catalog search and charts, with automatic Piped and Invidious federation fallback.
+- **6-Tier Direct Audio Stream Waterfall:**
+  1. Direct InnerTube `ANDROID_VR` (unencrypted M4A/Opus audio directly from user IP with dynamic `visitorData`)
+  2. Direct InnerTube `IOS` (direct M4A/Opus + native HLS manifest via Media3 `exoplayer-hls`)
+  3. Direct InnerTube `ANDROID_TESTSUITE`
+  4. Direct InnerTube `TVHTML5_SIMPLY_EMBEDDED_PLAYER`
+  5. Live **Piped API** federation (auto-refreshes public instance directory + user custom gateway)
+  6. Live **Invidious API** federation (resolves direct URLs & relative `/latest_version?local=true` proxies)
+- **Matching Stream User-Agent & Automatic Tier Failover:** `mediaHttpClient` injects the exact client `User-Agent` matching the resolved `googlevideo.com` stream; if playback fails on any tier, `PlaybackController` cascades automatically to the next tier or cross-provider fallback.
 - **Offline Downloads:** Strictly disabled (`isDownloadable = false`) to comply with platform policies.
 
 ### 3. Jamendo (`JamendoProvider`)
