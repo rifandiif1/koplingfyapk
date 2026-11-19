@@ -47,6 +47,8 @@ data class PlaybackUiState(
     val playbackSpeed: Float = 1.0f,
     val autoQueueEnabled: Boolean = true,
     val isAutoQueueLoading: Boolean = false,
+    val sleepTimerRemainingMs: Long = 0L,
+    val sleepAfterCurrentTrack: Boolean = false,
     val errorMessage: String? = null
 )
 
@@ -69,6 +71,7 @@ class PlaybackController(
     private var resolveJob: Job? = null
     private var autoQueueJob: Job? = null
     private var prewarmJob: Job? = null
+    private var sleepTimerJob: Job? = null
     private var currentStreamAttempt = 0
     private val maxStreamAttempts = 4
     private var suppressLocalBroadcast = false
@@ -523,6 +526,16 @@ class PlaybackController(
         lastHandledEndTrackId = activeId
         lastHandledEndEpochMs = now
 
+        if (cur.sleepAfterCurrentTrack) {
+            mediaController?.pause()
+            _state.value = cur.copy(
+                isPlaying = false,
+                sleepAfterCurrentTrack = false,
+                sleepTimerRemainingMs = 0L
+            )
+            return
+        }
+
         when (cur.repeatMode) {
             RepeatModeState.ONE -> {
                 mediaController?.seekTo(0L)
@@ -537,6 +550,48 @@ class PlaybackController(
                 }
             }
         }
+    }
+
+    fun setSleepTimerMinutes(minutes: Int) {
+        sleepTimerJob?.cancel()
+        if (minutes <= 0) {
+            _state.value = _state.value.copy(sleepTimerRemainingMs = 0L, sleepAfterCurrentTrack = false)
+            return
+        }
+        val totalMs = minutes * 60_000L
+        val endEpoch = System.currentTimeMillis() + totalMs
+        _state.value = _state.value.copy(
+            sleepTimerRemainingMs = totalMs,
+            sleepAfterCurrentTrack = false
+        )
+        sleepTimerJob = scope.launch {
+            while (isActive) {
+                val left = (endEpoch - System.currentTimeMillis()).coerceAtLeast(0L)
+                _state.value = _state.value.copy(sleepTimerRemainingMs = left)
+                if (left <= 0L) {
+                    mediaController?.pause()
+                    _state.value = _state.value.copy(isPlaying = false, sleepTimerRemainingMs = 0L)
+                    break
+                }
+                delay(1_000L)
+            }
+        }
+    }
+
+    fun setSleepAfterCurrentTrack() {
+        sleepTimerJob?.cancel()
+        _state.value = _state.value.copy(
+            sleepTimerRemainingMs = 0L,
+            sleepAfterCurrentTrack = true
+        )
+    }
+
+    fun cancelSleepTimer() {
+        sleepTimerJob?.cancel()
+        _state.value = _state.value.copy(
+            sleepTimerRemainingMs = 0L,
+            sleepAfterCurrentTrack = false
+        )
     }
 
     fun toggleAutoQueue() {

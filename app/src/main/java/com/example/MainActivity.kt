@@ -405,7 +405,11 @@ private fun KoplingfyRootApp(
                         composable(Routes.LYRICS) {
                             LyricsScreen(
                                 viewModel = viewModel,
-                                onBack = { navController.popBackStack() }
+                                onBack = { navController.popBackStack() },
+                                onOpenListenTogether = {
+                                    navController.popBackStack()
+                                    navigateToTab(Routes.LISTEN_TOGETHER)
+                                }
                             )
                         }
                         composable(Routes.EQUALIZER) {

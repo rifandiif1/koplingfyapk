@@ -961,6 +961,12 @@ private fun ActiveRoomHeroCard(
     }
 }
 
+private fun resolveDefaultWebClientId(context: Context): String? {
+    val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
+    if (resId == 0) return null
+    return runCatching { context.getString(resId) }.getOrNull()?.takeIf { it.isNotBlank() }
+}
+
 private suspend fun attemptSilentGoogleSignIn(
     context: Context,
     credentialManager: CredentialManager,
@@ -970,7 +976,7 @@ private suspend fun attemptSilentGoogleSignIn(
         onAuthSuccess()
         return
     }
-    val clientId = runCatching { context.getString(R.string.default_web_client_id) }.getOrNull() ?: return
+    val clientId = resolveDefaultWebClientId(context) ?: return
     val googleIdOption = GetGoogleIdOption.Builder()
         .setFilterByAuthorizedAccounts(true)
         .setServerClientId(clientId)
@@ -997,10 +1003,9 @@ private fun launchInteractiveGoogleSignIn(
     onCancelled: () -> Unit,
     onError: (String) -> Unit
 ) {
-    val clientId = try {
-        context.getString(R.string.default_web_client_id)
-    } catch (_: Exception) {
-        onError("Konfigurasi Google Sign-In tidak ditemukan.")
+    val clientId = resolveDefaultWebClientId(context)
+    if (clientId == null) {
+        onError("Konfigurasi Google Sign-In (google-services.json) belum tersedia pada build ini.")
         return
     }
     val activity = context as? Activity
